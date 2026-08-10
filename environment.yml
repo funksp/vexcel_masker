@@ -1,0 +1,15 @@
+# Create the environment with:  conda env create -f environment.yml
+# Then activate it with:        conda activate vexcel-masker
+name: vexcel-masker
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - requests
+  - rasterio
+  - pyproj
+  - shapely
+  - pillow
+  - matplotlib
+  - jupyter

@@ -1,0 +1,7 @@
+config.ini
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+out/
+.DS_Store
+.venv/
