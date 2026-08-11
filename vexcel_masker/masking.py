@@ -282,7 +282,8 @@ def _exterior_xy(geom):
     return np.asarray(xs), np.asarray(ys)
 
 
-def oblique_keep(oriented, dsm, polygon, dilate=0.0, ray_step=2, buffer_px=15, step=None):
+def oblique_keep(oriented, dsm, polygon, dilate=0.0, ray_step=2, buffer_px=15,
+                 step=None, roi_headroom_m=25.0):
     """Boolean mask (oriented.image size): True where the pixel's ground point is
     inside the polygon.
 
@@ -300,16 +301,22 @@ def oblique_keep(oriented, dsm, polygon, dilate=0.0, ray_step=2, buffer_px=15, s
     h, w = oriented.image.shape[:2]
     keep = np.zeros((h, w), bool)
 
-    # 1. where does the polygon land in this image? (drape its outline on the DSM)
+    # 1. Find the image region the polygon covers. We project its outline both at
+    #    ground level AND raised by `roi_headroom_m`, and take the union. A roof or
+    #    tree standing over the footprint leans toward the camera and projects
+    #    ABOVE the ground footprint, so the region we ray-cast must reach up to
+    #    cover it -- otherwise a leaning roof gets clipped by a straight edge.
     px, py = _exterior_xy(geom)
     pz = dsm.sample(px, py)
     pz = np.where(np.isfinite(pz), pz, dsm.zmin)
-    pu, pv = cam.world_to_pixel(px, py, pz)
-    good = np.isfinite(pu) & np.isfinite(pv)
+    u_lo, v_lo = cam.world_to_pixel(px, py, pz)
+    u_hi, v_hi = cam.world_to_pixel(px, py, pz + roi_headroom_m)
+    allu = np.concatenate([u_lo, u_hi]); allv = np.concatenate([v_lo, v_hi])
+    good = np.isfinite(allu) & np.isfinite(allv)
     if not good.any():
         return keep
-    u0 = max(0, int(np.min(pu[good])) - buffer_px); u1 = min(w, int(np.max(pu[good])) + buffer_px)
-    v0 = max(0, int(np.min(pv[good])) - buffer_px); v1 = min(h, int(np.max(pv[good])) + buffer_px)
+    u0 = max(0, int(np.min(allu[good])) - buffer_px); u1 = min(w, int(np.max(allu[good])) + buffer_px)
+    v0 = max(0, int(np.min(allv[good])) - buffer_px); v1 = min(h, int(np.max(allv[good])) + buffer_px)
     if u1 <= u0 or v1 <= v0:
         return keep
 
@@ -332,25 +339,27 @@ def oblique_keep(oriented, dsm, polygon, dilate=0.0, ray_step=2, buffer_px=15, s
 
 
 def mask_oblique(oriented, dsm, polygon, fill="magenta", dilate=0.0, zoom=True,
-                 ray_step=2, buffer_px=15, step=None):
+                 ray_step=2, buffer_px=15, step=None, roi_headroom_m=25.0):
     """Mask an oblique image to a polygon: keep inside, paint `fill` outside.
 
     `dilate` grows the polygon by that many feet (negative shrinks). `zoom=True`
     (default) crops tight to the polygon; False keeps the whole crop.
+    `roi_headroom_m` is how tall (metres) a structure over the footprint can be
+    before it gets clipped -- raise it for tall buildings.
     """
-    keep = oblique_keep(oriented, dsm, polygon, dilate, ray_step, buffer_px, step)
+    keep = oblique_keep(oriented, dsm, polygon, dilate, ray_step, buffer_px, step, roi_headroom_m)
     return _crop_and_apply(oriented.image, keep, fill, margin=buffer_px, zoom=zoom)
 
 
 def outline_oblique(oriented, dsm, polygon, color="magenta", dilate=0.0, thickness=2,
-                    zoom=True, margin=40, ray_step=2, buffer_px=15, step=None):
+                    zoom=True, margin=40, ray_step=2, buffer_px=15, step=None, roi_headroom_m=25.0):
     """Draw the mask's border on the oblique (no masking) so you can check fit.
 
     Same geometry as `mask_oblique`, but instead of hiding the outside it strokes
     the boundary line onto the real image -- verify alignment from one picture.
     `dilate` grows/shrinks the polygon by that many feet first.
     """
-    keep = oblique_keep(oriented, dsm, polygon, dilate, ray_step, buffer_px, step)
+    keep = oblique_keep(oriented, dsm, polygon, dilate, ray_step, buffer_px, step, roi_headroom_m)
     return _draw_outline(oriented.image, keep, color, thickness, zoom, margin)
 
 

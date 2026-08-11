@@ -20,6 +20,61 @@ already flattened onto the ground, masking is a simple polygon rasterise.)
 
 Everything is heavily commented so it can be handed to someone new.
 
+## How the oblique masking works
+
+### The simple version (for anyone)
+
+An **oblique** photo is taken from an angle, not straight down. That angle is
+useful (you can see the sides of houses), but it plays a trick: tall things
+**lean**. A neighbour's two-storey house leans over into the photo and *appears*
+to sit on top of ground that isn't theirs. So if we just drew the property lines
+flat onto the photo, we'd accidentally scoop up the neighbour's roof.
+
+To avoid that, we don't work in the flat photo — we figure out, for **every dot
+in the photo, which real spot on the ground it is actually showing.** Picture
+shining a laser from the camera out through each dot until it lands on a 3-D
+model of the neighbourhood (we have one — it's a height map called a DSM).
+Wherever the laser lands is the true spot that dot is looking at. Then we ask one
+question: *is that spot inside the property?* If yes, keep the dot; if no, hide it.
+
+Because the laser stops at the **first** thing it touches, blocked views take
+care of themselves: if a neighbour's roof is in the way of the backyard, the
+laser hits the roof (which is the neighbour's), so we correctly hide it instead
+of pretending we can see the yard behind it.
+
+> **In one line:** for every pixel we trace where it really lands on the ground,
+> and keep it only if that ground is inside the property — so leaning neighbours
+> and blocked views are handled automatically.
+
+For a straight-down **ortho** image none of this is needed: it's already been
+flattened onto the ground like a map, so we can lay the property outline straight
+onto it.
+
+### The slightly more technical version
+
+An oblique is a **perspective projection of a 3-D scene**, so there is no single
+scale (GSD) that maps the whole image to the ground — near things are big, far
+things small, tall things shift. That rules out the flat, affine "draw the
+polygon on the image" approach that works for orthos.
+
+So we do **backward ray-casting against a DSM**:
+
+1. **Reconstruct the camera.** From Vexcel's per-image metadata we recover the
+   camera's exact position and orientation, giving us, for any pixel, the precise
+   3-D ray of light that produced it (`camera.py`).
+2. **Trace each ray to the surface.** We march that ray through the DSM (a height
+   map of ground, roofs and trees) until it first crosses the surface. That first
+   intersection is the real `(X, Y, Z)` the pixel sees (`masking.py`,
+   `DSM.first_hit`).
+3. **Test the ground point.** Take the hit's `(X, Y)` and check it against the
+   parcel or building polygon (point-in-polygon). Inside → keep, outside → mask.
+
+Taking the **first** hit is what makes occlusion free: a roof blocking the yard
+is struck first, so that pixel is tested as the roof's location (outside the
+parcel) rather than the hidden yard. The result is a mask that respects real 3-D
+geometry — tall neighbours leaning in are excluded, and surfaces truly inside the
+parcel are kept, even where the perspective distorts them.
+
 ## Setup
 
 1. **Install** (pick one):
