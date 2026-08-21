@@ -1,15 +1,22 @@
 -- ============================================================
 -- QUOTE_SPINE :: data spine for the AI quote flow (PRICE / PREVIEW)
--- Snowflake DDL — POC scaffold  (rev 2)
+-- Snowflake DDL — POC scaffold  (rev 3)
 --
 -- Layout: medallion (BRONZE raw -> SILVER normalized -> GOLD serving)
--- 13 tables + 2 views. The 7 tables marked [CORE] plus the
+-- 12 tables + 2 views. The 7 tables marked [CORE] plus the
 -- ATTRIBUTE_OVERRIDE view are the minimum for the three confidence methods.
 --
 -- rev 2 change: no live quote-event stream is available. The prefill-vs-used
 -- override signal (method 2) is derived at rest from ATTRIBUTE_OBSERVATION
 -- via the ATTRIBUTE_OVERRIDE view, so BRONZE.QUOTE_FLOW_EVENTS and
 -- SILVER.VALIDATION_EVENT are removed.
+--
+-- rev 3 change: BRONZE.VERISK_360VALUE removed. The book feed already carries
+-- prefill, used, the historical Verisk MERC, and (required) Verisk's per-attribute
+-- assumptions, so it lands as one book payload. NOTE: this is the HISTORICAL MERC
+-- computed on the OLD used attributes. The fresh Verisk MERC on the spine's
+-- RESOLVED characteristics ('mercAssessment') is a live call whose result lands
+-- in GOLD.MERC_ESTIMATE (estimator='verisk_360') -- it is not a bronze source.
 --
 -- H3 cells stored as NUMBER(38,0) integer indexes from Snowflake's native
 -- H3 functions (GA 2024-06). Swap to VARCHAR + *_STRING variants for hex ids.
@@ -26,15 +33,21 @@ CREATE SCHEMA IF NOT EXISTS QUOTE_SPINE.GOLD;     -- precomputed stats + serving
 -- BRONZE  — payloads land as VARIANT; rows are never mutated
 -- ============================================================
 
--- Book records MUST carry prefill AND used values as two distinct persisted
--- fields. If prefill is overwritten to equal used at bind, method 2 is empty.
+-- Single book feed. The raw payload MUST carry, as distinct fields:
+--   * prefill attribute values      -> silver fans out to source='book_prefill'
+--   * used attribute values         -> silver fans out to source='book_used'
+--   * historical Verisk MERC         -> baseline (computed on the OLD used attrs)
+--   * Verisk per-attribute assumptions -> silver fans out to source='verisk'
+-- Two dependencies: (1) prefill must NOT be overwritten to equal used at bind,
+-- or method 2 is empty; (2) the Verisk breakdown (not just the $ total) must be
+-- present, or Verisk is lost as an attribute source and source-agreement weakens.
 CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.BOOK_POLICY_SNAPSHOT (
     load_id       STRING        NOT NULL,
     source_file   STRING,
     ingested_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
     policy_id     STRING,
     quote_id      STRING,
-    raw           VARIANT       NOT NULL     -- full record incl. prefill AND used attrs
+    raw           VARIANT       NOT NULL     -- prefill + used + historical MERC + Verisk assumptions
 );
 
 CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.VEXCEL_PROPERTY_INFO (
@@ -43,13 +56,6 @@ CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.VEXCEL_PROPERTY_INFO (
     request_lat   FLOAT,
     request_lng   FLOAT,
     raw           VARIANT       NOT NULL     -- Property Info API payload
-);
-
-CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.VERISK_360VALUE (
-    load_id       STRING        NOT NULL,
-    ingested_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-    quote_id      STRING,
-    raw           VARIANT       NOT NULL     -- MERC + the attribute assumptions Verisk used
 );
 
 
@@ -248,6 +254,10 @@ CREATE OR REPLACE TABLE QUOTE_SPINE.GOLD.PROPERTY_ANOMALY (
 CLUSTER BY (property_key);
 
 -- Verisk 360 MERC + internal challenger, one row per estimator.
+-- This is where the FRESH Verisk call on the spine's resolved characteristics
+-- lands (estimator='verisk_360'), distinct from the historical MERC in the book.
+-- characteristics_hash records which resolved attribute set produced each number,
+-- so the challenger comparison is always like-for-like.
 CREATE OR REPLACE TABLE QUOTE_SPINE.GOLD.MERC_ESTIMATE (
     property_key         NUMBER(38,0)  NOT NULL,
     quote_id             STRING,
