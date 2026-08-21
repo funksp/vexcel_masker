@@ -1,0 +1,317 @@
+-- ============================================================
+-- QUOTE_SPINE :: data spine for the AI quote flow (PRICE / PREVIEW)
+-- Snowflake DDL — POC scaffold
+--
+-- Layout: medallion (BRONZE raw -> SILVER normalized -> GOLD serving)
+-- 15 tables + 1 serving view. The 8 tables marked [CORE] are the
+-- minimum needed to produce the three confidence methods.
+--
+-- H3 cells are stored as NUMBER(38,0) integer indexes produced by
+-- Snowflake's native H3 functions (GA since 2024-06). Swap to VARCHAR
+-- + the *_STRING variants if you prefer hex cell ids.
+-- ============================================================
+
+CREATE DATABASE IF NOT EXISTS QUOTE_SPINE;
+
+CREATE SCHEMA IF NOT EXISTS QUOTE_SPINE.BRONZE;   -- raw source landings, append-only
+CREATE SCHEMA IF NOT EXISTS QUOTE_SPINE.SILVER;   -- normalized, entity-resolved
+CREATE SCHEMA IF NOT EXISTS QUOTE_SPINE.GOLD;     -- precomputed stats + serving
+
+
+-- ============================================================
+-- BRONZE  — payloads land as VARIANT; rows are never mutated
+-- ============================================================
+
+CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.BOOK_POLICY_SNAPSHOT (
+    load_id       STRING        NOT NULL,
+    source_file   STRING,
+    ingested_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    policy_id     STRING,
+    quote_id      STRING,
+    raw           VARIANT       NOT NULL     -- full record incl. prefill AND used attrs
+);
+
+CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.VEXCEL_PROPERTY_INFO (
+    load_id       STRING        NOT NULL,
+    ingested_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    request_lat   FLOAT,
+    request_lng   FLOAT,
+    raw           VARIANT       NOT NULL     -- Property Info API payload
+);
+
+CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.VERISK_360VALUE (
+    load_id       STRING        NOT NULL,
+    ingested_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    quote_id      STRING,
+    raw           VARIANT       NOT NULL     -- MERC + the attribute assumptions Verisk used
+);
+
+CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.QUOTE_FLOW_EVENTS (
+    load_id       STRING        NOT NULL,
+    ingested_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    quote_id      STRING,
+    raw           VARIANT       NOT NULL     -- prefill-shown / member-action stream
+);
+
+
+-- ============================================================
+-- SILVER — normalized + entity-resolved (the spine lives here)
+-- ============================================================
+
+-- [CORE] Controlled vocabulary of dwelling characteristics.
+-- Drives BOTH the confidence math and the validation decision.
+CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.ATTRIBUTE_REGISTRY (
+    attribute_id           STRING        NOT NULL PRIMARY KEY,   -- e.g. 'ROOF_TYPE'
+    display_name           STRING        NOT NULL,
+    data_type              STRING        NOT NULL,               -- categorical | numeric | boolean
+    unit                   STRING,                               -- sqft, years, ...
+    allowed_values         ARRAY,                                -- categoricals; NULL for numeric
+    numeric_min            FLOAT,
+    numeric_max            FLOAT,
+    is_merc_input          BOOLEAN       NOT NULL DEFAULT FALSE, -- does it feed the MERC calc?
+    business_impact_weight NUMBER(5,3)   NOT NULL DEFAULT 0,     -- 0..1, drives validation priority
+    validation_cost        NUMBER(5,3)   NOT NULL DEFAULT 0,     -- friction of asking the member
+    updated_at             TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- [CORE] Canonical property entity. H3 precomputed at 4 resolutions.
+-- Populate h3_* with e.g.  H3_POINT_TO_CELL(geocode, 8)
+CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.PROPERTY (
+    property_key     NUMBER(38,0)  NOT NULL PRIMARY KEY,          -- stable surrogate
+    geocode          GEOGRAPHY,                                   -- point, WGS84
+    latitude         FLOAT,
+    longitude        FLOAT,
+    address_line     STRING,
+    city             STRING,
+    state            STRING,
+    postal_code      STRING,
+    parcel_id        STRING,                                      -- nullable
+    h3_r7            NUMBER(38,0),
+    h3_r8            NUMBER(38,0),
+    h3_r9            NUMBER(38,0),
+    h3_r10           NUMBER(38,0),
+    geocode_quality  STRING,                                      -- rooftop | interpolated | centroid
+    created_at       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    updated_at       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (h3_r8);
+
+-- [CORE] Entity-resolution crosswalk. Confidence is on the MATCH itself,
+-- not on any attribute value.
+CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.PROPERTY_XWALK (
+    property_key       NUMBER(38,0)  NOT NULL,
+    source             STRING        NOT NULL,   -- book | vexcel | verisk
+    source_natural_id  STRING        NOT NULL,   -- policy_id, vexcel id, parcel, ...
+    match_method       STRING,                   -- parcel | rooftop_geo | address_hash
+    match_confidence   NUMBER(5,3),              -- 0..1 on the link
+    linked_at          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_xwalk PRIMARY KEY (source, source_natural_id)
+);
+
+-- [CORE] The tall observation fact. Every source flattens into this shape.
+-- value_text for categorical/boolean, value_num for numeric.
+CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.ATTRIBUTE_OBSERVATION (
+    obs_id            NUMBER(38,0)  IDENTITY PRIMARY KEY,
+    property_key      NUMBER(38,0)  NOT NULL,
+    attribute_id      STRING        NOT NULL,
+    source            STRING        NOT NULL,   -- book_prefill | book_used | vexcel | verisk | preview
+    value_text        STRING,
+    value_num         FLOAT,
+    unit              STRING,
+    source_confidence NUMBER(5,3),              -- vendor/model confidence if provided
+    observed_at       TIMESTAMP_NTZ NOT NULL,   -- when the source asserted the value
+    evidence          VARIANT,                  -- tile id, model version, api confidence, ...
+    load_id           STRING,
+    ingested_at       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (property_key, attribute_id);
+
+-- [CORE] The override log. NON-BACKFILLABLE — capture from day one.
+-- corrected_value makes this double as a correction-target distribution.
+CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.VALIDATION_EVENT (
+    event_id          NUMBER(38,0)  IDENTITY PRIMARY KEY,
+    property_key      NUMBER(38,0)  NOT NULL,
+    quote_id          STRING,
+    attribute_id      STRING        NOT NULL,
+    prefilled_value   STRING,
+    prefill_source    STRING,
+    member_action     STRING        NOT NULL,   -- accepted | overridden | added | skipped
+    corrected_value   STRING,                   -- what the member changed it TO
+    h3_r8             NUMBER(38,0),             -- denormalized for fast regional rollups
+    occurred_at       TIMESTAMP_NTZ NOT NULL
+)
+CLUSTER BY (h3_r8, attribute_id);
+
+-- PREVIEW exterior-condition / peril observations (imagery + DSM derived).
+CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.PREVIEW_OBSERVATION (
+    obs_id              NUMBER(38,0)  IDENTITY PRIMARY KEY,
+    property_key        NUMBER(38,0)  NOT NULL,
+    observation_type    STRING        NOT NULL,   -- roof_condition | debris | pool | ...
+    peril               STRING,                   -- linked peril if applicable
+    severity            STRING,                   -- low | moderate | high
+    confidence          NUMBER(5,3),
+    imagery_captured_at DATE,
+    evidence            VARIANT,                  -- tile/DSM refs, model version
+    observed_at         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (property_key);
+
+
+-- ============================================================
+-- GOLD — precomputed spatial stats + resolved serving state
+-- ============================================================
+
+-- [CORE] Per (cell x resolution x attribute) distributions + override signal.
+-- Feeds method 3 (spatial posterior) and method 2 (regional override rate).
+-- Recompute at every resolution; serving picks finest cell with enough n.
+CREATE OR REPLACE TABLE QUOTE_SPINE.GOLD.H3_ATTRIBUTE_STATS (
+    h3_index            NUMBER(38,0)  NOT NULL,
+    resolution          NUMBER(2,0)   NOT NULL,   -- 7 | 8 | 9 | 10
+    attribute_id        STRING        NOT NULL,
+    n_properties        NUMBER(38,0)  NOT NULL,
+    -- categorical summary
+    value_distribution  VARIANT,                  -- {"HIP":0.62,"GABLE":0.31,...}
+    modal_value         STRING,
+    modal_share         NUMBER(5,3),
+    -- numeric summary
+    mean_val            FLOAT,
+    stddev_val          FLOAT,
+    median_val          FLOAT,
+    p10_val             FLOAT,
+    p90_val             FLOAT,
+    -- override signal (method 2)
+    times_prefilled     NUMBER(38,0),
+    times_overridden    NUMBER(38,0),
+    override_rate       NUMBER(5,3),
+    dominant_correction STRING,
+    computed_at         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_h3stats PRIMARY KEY (h3_index, resolution, attribute_id)
+)
+CLUSTER BY (h3_index, attribute_id);
+
+-- [CORE] Resolved per-property best estimate. Confidence kept DECOMPOSED
+-- so explainability can show drivers; resolved_confidence is the composite.
+CREATE OR REPLACE TABLE QUOTE_SPINE.GOLD.PROPERTY_CHARACTERISTICS (
+    property_key         NUMBER(38,0) NOT NULL,
+    attribute_id         STRING       NOT NULL,
+    resolved_value       STRING,                    -- text repr of chosen value
+    resolved_value_num   FLOAT,
+    resolved_source      STRING,                    -- which source won
+    -- component confidence signals
+    source_agreement     NUMBER(5,3),               -- do the streams concur?
+    spatial_posterior    NUMBER(5,3),               -- method 3
+    override_reliability NUMBER(5,3),               -- method 2 (1 - regional override_rate)
+    anomaly_penalty      NUMBER(5,3),               -- method 1 contribution
+    resolved_confidence  NUMBER(5,3),               -- composite PRICE consumes
+    requires_validation  BOOLEAN      DEFAULT FALSE,
+    validation_reason    STRING,                    -- low_confidence | high_impact
+    anomaly_flag         BOOLEAN      DEFAULT FALSE,
+    contributing_sources ARRAY,
+    evidence             VARIANT,
+    computed_at          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_char PRIMARY KEY (property_key, attribute_id)
+)
+CLUSTER BY (property_key);
+
+-- [CORE] Method 1 output: within-property inconsistencies / review candidates.
+CREATE OR REPLACE TABLE QUOTE_SPINE.GOLD.PROPERTY_ANOMALY (
+    anomaly_id          NUMBER(38,0)  IDENTITY PRIMARY KEY,
+    property_key        NUMBER(38,0)  NOT NULL,
+    anomaly_type        STRING        NOT NULL,   -- attribute_conflict | implausible_combo | merc_outlier
+    attributes_involved ARRAY,
+    description         STRING,
+    severity            STRING,
+    detector            STRING,                   -- rule id or model version
+    detected_at         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (property_key);
+
+-- Verisk 360 MERC + internal challenger, one row per estimator.
+CREATE OR REPLACE TABLE QUOTE_SPINE.GOLD.MERC_ESTIMATE (
+    property_key         NUMBER(38,0)  NOT NULL,
+    quote_id             STRING,
+    estimator            STRING        NOT NULL,   -- verisk_360 | internal_challenger
+    merc_value           NUMBER(14,2),
+    ci_low               NUMBER(14,2),
+    ci_high              NUMBER(14,2),
+    characteristics_hash STRING,                   -- which resolved attr set produced this
+    model_version        STRING,
+    computed_at          TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_merc PRIMARY KEY (property_key, estimator, quote_id)
+);
+
+-- Property risk signals (imagery, H3 context, claims, weather, hazard).
+CREATE OR REPLACE TABLE QUOTE_SPINE.GOLD.RISK_INDICATOR (
+    indicator_id     NUMBER(38,0)  IDENTITY PRIMARY KEY,
+    property_key     NUMBER(38,0)  NOT NULL,
+    indicator_type   STRING        NOT NULL,   -- wildfire | roof_age | proximity_hazard | ...
+    value            STRING,
+    importance       NUMBER(5,3),              -- weight / importance
+    derived_from     STRING,                   -- imagery | h3_context | claims | weather
+    evidence         VARIANT,
+    computed_at      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (property_key);
+
+
+-- ============================================================
+-- SERVING VIEW — assembles the POC JSON per property
+-- (only a few sections shown; extend with the remaining ones)
+-- ============================================================
+
+CREATE OR REPLACE VIEW QUOTE_SPINE.GOLD.PROPERTY_QUOTE_JSON AS
+SELECT
+    p.property_key,
+    OBJECT_CONSTRUCT(
+        'propertyIdentity', OBJECT_CONSTRUCT(
+            'addressLine', p.address_line,
+            'parcelId',    p.parcel_id,
+            'geocode',     OBJECT_CONSTRUCT('lat', p.latitude, 'lng', p.longitude),
+            'h3_r8',       p.h3_r8
+        ),
+        'characteristics', (
+            SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
+                'attributeId',   c.attribute_id,
+                'resolvedValue', c.resolved_value,
+                'confidence',    c.resolved_confidence,
+                'sources',       c.contributing_sources,
+                'evidence',      c.evidence))
+            FROM QUOTE_SPINE.GOLD.PROPERTY_CHARACTERISTICS c
+            WHERE c.property_key = p.property_key
+        ),
+        'attributesRequiringValidation', (
+            SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
+                'attributeId', c.attribute_id,
+                'reason',      c.validation_reason,
+                'confidence',  c.resolved_confidence))
+            FROM QUOTE_SPINE.GOLD.PROPERTY_CHARACTERISTICS c
+            WHERE c.property_key = p.property_key AND c.requires_validation
+        ),
+        'anomalies', (
+            SELECT ARRAY_AGG(OBJECT_CONSTRUCT(
+                'type',        a.anomaly_type,
+                'description', a.description,
+                'severity',    a.severity))
+            FROM QUOTE_SPINE.GOLD.PROPERTY_ANOMALY a
+            WHERE a.property_key = p.property_key
+        )
+        -- TODO: previewObservations, riskIndicators, mercAssessment,
+        --       internalMercChallenger, mercReliability, explainability
+    ) AS quote_payload
+FROM QUOTE_SPINE.SILVER.PROPERTY p;
+
+
+-- ============================================================
+-- Example ATTRIBUTE_REGISTRY seed (illustrative)
+-- ============================================================
+INSERT INTO QUOTE_SPINE.SILVER.ATTRIBUTE_REGISTRY
+    (attribute_id, display_name, data_type, unit, is_merc_input, business_impact_weight, validation_cost)
+SELECT 'YEAR_BUILT',    'Year Built',        'numeric',     'year', TRUE,  0.90, 0.20 UNION ALL
+SELECT 'LIVING_AREA',   'Living Area',       'numeric',     'sqft', TRUE,  0.95, 0.30 UNION ALL
+SELECT 'ROOF_TYPE',     'Roof Type',         'categorical', NULL,   TRUE,  0.70, 0.40 UNION ALL
+SELECT 'ROOF_AGE',      'Roof Age',          'numeric',     'year', TRUE,  0.80, 0.50 UNION ALL
+SELECT 'STORIES',       'Number of Stories', 'numeric',     NULL,   TRUE,  0.75, 0.20 UNION ALL
+SELECT 'EXT_WALL_TYPE', 'Exterior Wall',     'categorical', NULL,   TRUE,  0.65, 0.40 UNION ALL
+SELECT 'FOUNDATION',    'Foundation Type',   'categorical', NULL,   TRUE,  0.60, 0.60 UNION ALL
+SELECT 'BATHROOMS',     'Bathroom Count',    'numeric',     NULL,   TRUE,  0.55, 0.30 UNION ALL
+SELECT 'CONSTR_QUALITY','Construction Grade','categorical', NULL,   TRUE,  0.85, 0.70;
