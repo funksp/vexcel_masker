@@ -1,14 +1,18 @@
 -- ============================================================
 -- QUOTE_SPINE :: data spine for the AI quote flow (PRICE / PREVIEW)
--- Snowflake DDL — POC scaffold
+-- Snowflake DDL — POC scaffold  (rev 2)
 --
 -- Layout: medallion (BRONZE raw -> SILVER normalized -> GOLD serving)
--- 15 tables + 1 serving view. The 8 tables marked [CORE] are the
--- minimum needed to produce the three confidence methods.
+-- 13 tables + 2 views. The 7 tables marked [CORE] plus the
+-- ATTRIBUTE_OVERRIDE view are the minimum for the three confidence methods.
 --
--- H3 cells are stored as NUMBER(38,0) integer indexes produced by
--- Snowflake's native H3 functions (GA since 2024-06). Swap to VARCHAR
--- + the *_STRING variants if you prefer hex cell ids.
+-- rev 2 change: no live quote-event stream is available. The prefill-vs-used
+-- override signal (method 2) is derived at rest from ATTRIBUTE_OBSERVATION
+-- via the ATTRIBUTE_OVERRIDE view, so BRONZE.QUOTE_FLOW_EVENTS and
+-- SILVER.VALIDATION_EVENT are removed.
+--
+-- H3 cells stored as NUMBER(38,0) integer indexes from Snowflake's native
+-- H3 functions (GA 2024-06). Swap to VARCHAR + *_STRING variants for hex ids.
 -- ============================================================
 
 CREATE DATABASE IF NOT EXISTS QUOTE_SPINE;
@@ -22,6 +26,8 @@ CREATE SCHEMA IF NOT EXISTS QUOTE_SPINE.GOLD;     -- precomputed stats + serving
 -- BRONZE  — payloads land as VARIANT; rows are never mutated
 -- ============================================================
 
+-- Book records MUST carry prefill AND used values as two distinct persisted
+-- fields. If prefill is overwritten to equal used at bind, method 2 is empty.
 CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.BOOK_POLICY_SNAPSHOT (
     load_id       STRING        NOT NULL,
     source_file   STRING,
@@ -44,13 +50,6 @@ CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.VERISK_360VALUE (
     ingested_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
     quote_id      STRING,
     raw           VARIANT       NOT NULL     -- MERC + the attribute assumptions Verisk used
-);
-
-CREATE OR REPLACE TABLE QUOTE_SPINE.BRONZE.QUOTE_FLOW_EVENTS (
-    load_id       STRING        NOT NULL,
-    ingested_at   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-    quote_id      STRING,
-    raw           VARIANT       NOT NULL     -- prefill-shown / member-action stream
 );
 
 
@@ -109,6 +108,7 @@ CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.PROPERTY_XWALK (
 );
 
 -- [CORE] The tall observation fact. Every source flattens into this shape.
+-- prefill and used are just two source values: 'book_prefill' and 'book_used'.
 -- value_text for categorical/boolean, value_num for numeric.
 CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.ATTRIBUTE_OBSERVATION (
     obs_id            NUMBER(38,0)  IDENTITY PRIMARY KEY,
@@ -126,22 +126,6 @@ CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.ATTRIBUTE_OBSERVATION (
 )
 CLUSTER BY (property_key, attribute_id);
 
--- [CORE] The override log. NON-BACKFILLABLE — capture from day one.
--- corrected_value makes this double as a correction-target distribution.
-CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.VALIDATION_EVENT (
-    event_id          NUMBER(38,0)  IDENTITY PRIMARY KEY,
-    property_key      NUMBER(38,0)  NOT NULL,
-    quote_id          STRING,
-    attribute_id      STRING        NOT NULL,
-    prefilled_value   STRING,
-    prefill_source    STRING,
-    member_action     STRING        NOT NULL,   -- accepted | overridden | added | skipped
-    corrected_value   STRING,                   -- what the member changed it TO
-    h3_r8             NUMBER(38,0),             -- denormalized for fast regional rollups
-    occurred_at       TIMESTAMP_NTZ NOT NULL
-)
-CLUSTER BY (h3_r8, attribute_id);
-
 -- PREVIEW exterior-condition / peril observations (imagery + DSM derived).
 CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.PREVIEW_OBSERVATION (
     obs_id              NUMBER(38,0)  IDENTITY PRIMARY KEY,
@@ -156,6 +140,31 @@ CREATE OR REPLACE TABLE QUOTE_SPINE.SILVER.PREVIEW_OBSERVATION (
 )
 CLUSTER BY (property_key);
 
+-- [CORE] Method 2 signal, derived at rest. Pairs each property's book_prefill
+-- against its book_used for the same attribute; disagreement = override.
+-- Because both sides are retained, you get direction/bias, not just a flag.
+CREATE OR REPLACE VIEW QUOTE_SPINE.SILVER.ATTRIBUTE_OVERRIDE AS
+SELECT
+    pf.property_key,
+    pf.attribute_id,
+    COALESCE(pf.value_text, TO_VARCHAR(pf.value_num)) AS prefill_value,
+    COALESCE(us.value_text, TO_VARCHAR(us.value_num)) AS used_value,
+    pf.value_num                                      AS prefill_num,
+    us.value_num                                      AS used_num,
+    NOT EQUAL_NULL(
+        COALESCE(pf.value_text, TO_VARCHAR(pf.value_num)),
+        COALESCE(us.value_text, TO_VARCHAR(us.value_num))
+    )                                                 AS was_overridden,
+    p.h3_r7, p.h3_r8, p.h3_r9, p.h3_r10
+FROM QUOTE_SPINE.SILVER.ATTRIBUTE_OBSERVATION pf
+JOIN QUOTE_SPINE.SILVER.ATTRIBUTE_OBSERVATION us
+  ON  pf.property_key = us.property_key
+  AND pf.attribute_id = us.attribute_id
+JOIN QUOTE_SPINE.SILVER.PROPERTY p
+  ON  p.property_key = pf.property_key
+WHERE pf.source = 'book_prefill'
+  AND us.source = 'book_used';
+
 
 -- ============================================================
 -- GOLD — precomputed spatial stats + resolved serving state
@@ -164,6 +173,18 @@ CLUSTER BY (property_key);
 -- [CORE] Per (cell x resolution x attribute) distributions + override signal.
 -- Feeds method 3 (spatial posterior) and method 2 (regional override rate).
 -- Recompute at every resolution; serving picks finest cell with enough n.
+--
+-- Populate the override columns from SILVER.ATTRIBUTE_OVERRIDE, e.g.:
+--   INSERT INTO QUOTE_SPINE.GOLD.H3_ATTRIBUTE_STATS
+--     (h3_index, resolution, attribute_id, n_properties,
+--      times_prefilled, times_overridden, override_rate, dominant_correction)
+--   SELECT h3_r8, 8, attribute_id, COUNT(*),
+--          COUNT(*),
+--          SUM(IFF(was_overridden,1,0)),
+--          SUM(IFF(was_overridden,1,0)) / NULLIF(COUNT(*),0),
+--          MODE(IFF(was_overridden, used_value, NULL))
+--   FROM QUOTE_SPINE.SILVER.ATTRIBUTE_OVERRIDE
+--   GROUP BY h3_r8, attribute_id;
 CREATE OR REPLACE TABLE QUOTE_SPINE.GOLD.H3_ATTRIBUTE_STATS (
     h3_index            NUMBER(38,0)  NOT NULL,
     resolution          NUMBER(2,0)   NOT NULL,   -- 7 | 8 | 9 | 10
@@ -179,7 +200,7 @@ CREATE OR REPLACE TABLE QUOTE_SPINE.GOLD.H3_ATTRIBUTE_STATS (
     median_val          FLOAT,
     p10_val             FLOAT,
     p90_val             FLOAT,
-    -- override signal (method 2)
+    -- override signal (method 2), derived from ATTRIBUTE_OVERRIDE
     times_prefilled     NUMBER(38,0),
     times_overridden    NUMBER(38,0),
     override_rate       NUMBER(5,3),
