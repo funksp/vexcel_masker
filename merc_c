@@ -1,0 +1,792 @@
+# MERC Confidence Score
+
+*A method for scoring how much to trust the Minimum Estimated Rebuild Cost at the end of the homeowners quote flow*
+
+**Status:** Draft for review  ·  **Date:** September 2026  ·  **Audience:** Data Science, Actuarial, Product, Underwriting
+
+---
+
+## TL;DR
+
+At the end of the quote flow, every MERC gets a confidence label: 🟢 **High**, 🟡 **Medium** or 🔴 **Low**. The label answers one question:
+
+> **What is the chance that the final MERC is close enough to the true cost to rebuild?**
+
+It's built from three ingredients:
+
+| | Ingredient | The question it answers | Where the answer comes from |
+|:-:|---|---|---|
+| **1** | **Leftover attribute risk** | Could an attribute we *didn't* ask about still be wrong, and would it move MERC? | Existing attribute confidence model, correction history, MERC sensitivities |
+| **2** | **Engine uncertainty** | Even with perfect attributes, how precise is Verisk's estimate? | The range Verisk returns with the final MERC |
+| **3** | **Neighborhood check** | Does this home's cost per square foot look normal next to similar homes nearby? | Our book, pooled through the H3 hierarchy |
+
+Ingredients 1 and 2 combine into a probability that sets the tier. Ingredient 3 can only lower it.
+
+There are two ways to measure how much each attribute moves MERC:
+
+- **Option A: No extra calls.** A lookup table built once from a designed study of Verisk calls.
+- **Option B: A few extra calls.** For the one to three attributes that matter most on a quote, ask Verisk directly.
+
+> **Nothing upstream changes.** The attribute confidence model and the question logic stay exactly as they are. The score is a new step at the end.
+
+---
+
+## Contents
+
+1. [The problem](#1-the-problem)
+2. [Where this fits in the quote flow](#2-where-this-fits-in-the-quote-flow)
+3. [What confidence means](#3-what-confidence-means)
+4. [The recipe at a glance](#4-the-recipe-at-a-glance)
+5. [Ingredient 1: Leftover attribute risk](#5-ingredient-1-leftover-attribute-risk)
+6. [Measuring MERC impact: Option A or Option B](#6-measuring-merc-impact-option-a-or-option-b)
+7. [Ingredient 2: Engine uncertainty](#7-ingredient-2-engine-uncertainty)
+8. [Ingredient 3: Neighborhood check](#8-ingredient-3-neighborhood-check)
+9. [From probability to High, Medium, Low](#9-from-probability-to-high-medium-low)
+10. [Worked example](#10-worked-example)
+11. [Proving it works](#11-proving-it-works)
+12. [Contract checkpoints](#12-contract-checkpoints)
+13. [Rollout plan](#13-rollout-plan)
+14. [Known limitations](#14-known-limitations)
+
+**Appendices:** [A · Notation cheat sheet](#appendix-a-notation-cheat-sheet)  ·  [B · Where the MLE and prefill MERC calls fit](#appendix-b-where-the-mle-and-prefill-merc-calls-fit)  ·  [C · Reference code](#appendix-c-reference-code)
+
+---
+
+## 1. The problem
+
+> **In one sentence:** we want a trustworthy confidence label on the final MERC, without ever training a model on MERC.
+
+Our goal is a homeowners quote that asks as few questions as possible, ideally just the address. The flow gets close by prefilling attributes from Verisk and asking only about the ones our model doubts. That leaves one open question: **how much should we trust the MERC that comes out the other end?**
+
+Two constraints shape the answer.
+
+- **We can't use MERC as a response variable.** The Verisk agreement rules out training a regression on MERC, so we can't simply learn "how wrong is MERC" from data. Instead, we *assemble* the confidence from pieces we can defend: our attribute confidences, Verisk's own range, and how MERC responds when an attribute changes.
+- **The flow stays as it is.** The attribute model and the question logic already work. The score sits on top of them.
+
+---
+
+## 2. Where this fits in the quote flow
+
+> **In one sentence:** steps 1–5 are unchanged; the MERC confidence score is a new step 6.
+
+```mermaid
+flowchart LR
+    S1["1 · Address"] --> S2["2 · Verisk prefill"]
+    S2 --> S3["3 · Attribute<br/>confidence model"]
+    S3 --> S4["4 · Ask about<br/>low-confidence attributes"]
+    S4 --> S5["5 · Final Verisk call<br/>MERC + range"]
+    S5 --> S6["6 · MERC confidence<br/>High / Medium / Low"]
+
+    classDef existing fill:#F1F5F9,stroke:#94A3B8,color:#0F172A
+    classDef new fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#0F172A
+    class S1,S2,S3,S4,S5 existing
+    class S6 new
+```
+
+| Step | What happens | Change |
+|:-:|---|:-:|
+| 1 | Member provides their address | None |
+| 2 | Verisk returns prefilled attributes | None |
+| 3 | Our model scores confidence in each attribute | None |
+| 4 | Member confirms or provides the low-confidence attributes | None |
+| 5 | Verisk returns the final MERC and its range | None ¹ |
+| **6** | **MERC confidence score** | **New** |
+
+¹ One detail may matter here: passing every final attribute to Verisk explicitly. [Section 7](#7-ingredient-2-engine-uncertainty) explains when.
+
+---
+
+## 3. What confidence means
+
+> **In one sentence:** confidence is the probability that the final MERC lands within an agreed tolerance of the true rebuild cost.
+
+### Two kinds of error
+
+Even after the quote flow, the final MERC can miss the true rebuild cost for two separate reasons. We measure both on the log scale, so they simply add:
+
+$$
+\underbrace{E}_{\text{total error}} \;=\; \underbrace{D}_{\text{leftover attribute error}} \;+\; \underbrace{\varepsilon_V}_{\text{engine error}}
+$$
+
+Here $E = \ln(\text{true rebuild cost}) - \ln(\text{final MERC})$, so a positive $E$ means the MERC is too low.
+
+| | **Leftover attribute error** $D$ | **Engine error** $\varepsilon_V$ |
+|---|---|---|
+| **What it is** | An attribute we didn't ask about is wrong, so Verisk priced the wrong house | Verisk's estimate isn't exact, even for the right house |
+| **Could a question fix it?** | Yes, but we chose not to ask | No |
+| **What tells us about it** | Attribute confidence × how much MERC would move | The range Verisk returns |
+
+> 💡 **Why logs?** On the log scale, a difference of 0.05 is about 5%, and effects that multiply (area × cost per square foot × adjustments) become effects that add. That's what lets us build the score one attribute at a time. Tables in this document show impacts as percentages; the math underneath runs on logs.
+
+### The tolerance
+
+The tolerance says how far off the MERC may be and still count as right. It should be **asymmetric**:
+
+- A MERC that's **too low** leaves the home underinsured and leaks premium. Keep this side tight.
+- A MERC that's **too high** makes the quote less competitive. This side can be looser.
+
+$$
+C \;=\; P\big(-\tau_{\text{over}} \;\le\; E \;\le\; \tau_{\text{under}}\big)
+$$
+
+↳ **In words:** $C$ is the chance that the MERC is no more than $\tau_{\text{under}}$ too low and no more than $\tau_{\text{over}}$ too high.
+
+This document uses $\tau_{\text{under}} = 0.10$ and $\tau_{\text{over}} = 0.15$ (about 10% and 15%) for illustration. The real values are a business decision. They must be comfortably wider than Verisk's typical range, or engine error alone would keep every quote out of High.
+
+---
+
+## 4. The recipe at a glance
+
+> **In one sentence:** simulate what the leftover attribute errors could do to MERC, add Verisk's own spread, compute the chance of landing in tolerance, then run a neighborhood check.
+
+```mermaid
+flowchart LR
+    subgraph ING1["Ingredient 1 · Leftover attribute risk"]
+        direction TB
+        Q1["How likely is it wrong?<br/>existing attribute model"]
+        Q2["If wrong, what is it usually?<br/>correction history"]
+        Q3["How much would MERC move?<br/>Option A table or Option B calls"]
+        SIM["Simulate 100,000<br/>possible true houses"]
+        Q1 --> SIM
+        Q2 --> SIM
+        Q3 --> SIM
+    end
+
+    ENG["Ingredient 2 · Engine uncertainty<br/>Verisk range as a spread"]
+    NBR["Ingredient 3 · Neighborhood check<br/>cost per sq ft vs. similar homes"]
+
+    SIM --> CONF["Confidence C<br/>chance MERC is in tolerance"]
+    ENG --> CONF
+    CONF --> BASE["Base tier"]
+    BASE --> FINAL["Final tier<br/>+ main driver"]
+    NBR -->|can only lower| FINAL
+
+    classDef ingredient fill:#F1F5F9,stroke:#94A3B8,color:#0F172A
+    classDef result fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#0F172A
+    class Q1,Q2,Q3,SIM,ENG,NBR ingredient
+    class CONF,BASE,FINAL result
+```
+
+1. **List the attributes we didn't ask about.** Member-confirmed attributes count as known.
+2. **Look up three things for each:** how likely it's wrong, what it usually is when wrong, and how much that moves MERC.
+3. **Simulate 100,000 possible "true houses"** and the MERC error each one would create.
+4. **Add Verisk's engine spread** and compute $C$, the chance of landing in tolerance.
+5. **Turn $C$ into a base tier**, then apply the neighborhood check, which can only lower it.
+6. **Report the tier with its main driver**, such as "square footage".
+
+---
+
+## 5. Ingredient 1: Leftover attribute risk
+
+> **In one sentence:** for each attribute we didn't ask about, weigh how likely it is to be wrong against how much MERC would move if it were, then add up the possibilities.
+
+After step 4, every attribute is in one of two states:
+
+| State | Example | How we treat it |
+|---|---|---|
+| **Asked:** the member confirmed or provided it | Member confirmed "standard" quality | Known, no leftover risk |
+| **Not asked:** the prefill cleared our confidence threshold | Square footage at 86% confidence | Probably right, but not certain |
+
+For each **not-asked** attribute, we need three answers:
+
+| | Question | Source | New work? |
+|:-:|---|---|---|
+| **1** | How likely is it wrong? | Existing attribute model: $1 - p_k$ | None |
+| **2** | If it's wrong, what is it usually? | Correction history from our book | A lookup table |
+| **3** | How much would MERC move? | MERC sensitivities | Option A or B ([section 6](#6-measuring-merc-impact-option-a-or-option-b)) |
+
+Attributes that don't feed Verisk's MERC calculation can be skipped entirely, since their impact is zero.
+
+### 5.1 How likely is it wrong?
+
+This is our existing confidence score, used as is. If the model says square footage is 86% likely correct, there's a 14% chance it's wrong. Member-confirmed attributes are treated as correct.
+
+For continuous attributes, "correct" means inside the band the model was trained on (for example, within 5%). The next step covers what happens outside that band.
+
+> ⚠️ **Watch out:** this reads the scores as calibrated probabilities. A Bayesian logit model should deliver that, but confirm it on the validation set before relying on it.
+
+### 5.2 If it's wrong, what is it usually?
+
+Our book records every time a member or an inspection corrected a prefilled attribute. From that history we build a **correction profile** for each attribute. It uses attribute data only, never MERC, so it's contract-safe.
+
+| Attribute type | Correction profile | Example |
+|---|---|---|
+| **Continuous** (square footage, year built) | Distribution of the % change when the value was corrected | When square footage is wrong, it's usually about 18% larger (finished basement, addition) or about 12% smaller |
+| **Categorical** (stories, construction, roof, …) | When the prefill says X and is wrong, how often the truth is Y | Prefill says "frame" and is wrong → usually "masonry veneer" |
+
+> ⚠️ **Watch out:** square-footage corrections are **lumpy**, not bell-shaped, because basements and garages get included or excluded as whole chunks. Use the empirical distribution rather than a Normal.
+
+> 📌 **In practice:** corrections from the normal flow only cover attributes we flagged as low-confidence, which may be wrong in different ways from high-confidence ones. Lean on audit-arm and inspection corrections where you can ([section 11](#11-proving-it-works)). Where volume allows, build profiles by region; the same H3 fallback used elsewhere (r7 → r6 → r5 → r4 → state) works here too.
+
+### 5.3 How much would MERC move?
+
+This is the **MERC impact** $\Delta_k$: the change in log-MERC if attribute $k$ took its corrected value while everything else stayed the same.
+
+A useful property of rebuild-cost engines makes this manageable. MERC is mostly *area × cost per unit × adjustment factors*, and on the log scale those effects add. So we can measure each attribute's impact **one at a time** and sum them, rather than testing every combination.
+
+For continuous attributes, one number per attribute is enough, the **elasticity** $e_k$:
+
+$$
+\Delta_k \;\approx\; e_k \times \ln\!\left(\frac{\text{true value}}{\text{prefill value}}\right)
+$$
+
+↳ **In words:** with an elasticity of 0.85, if the home is really 18% larger, the MERC for the true house is about 15% higher.
+
+For categorical attributes, the impact is a single number per switch, such as frame → masonry veneer = +5%.
+
+Where these numbers come from is the one real design choice. [Section 6](#6-measuring-merc-impact-option-a-or-option-b) lays out the two options.
+
+### 5.4 Putting it together: simulate
+
+$$
+D \;=\; \sum_{k \,\in\, \text{not asked}} W_k \times \Delta_k
+$$
+
+↳ **In words:** the leftover error is the sum, over attributes we didn't ask about, of *"was it wrong?"* times *"how much did that move MERC?"* Here $W_k$ is 1 with probability $1 - p_k$, and 0 otherwise.
+
+We don't solve this on paper. We **simulate** it:
+
+1. Create 100,000 draws.
+2. In each draw, flip a weighted coin for every not-asked attribute: it's wrong with probability $1 - p_k$.
+3. If it's wrong, pick a corrected value from its correction profile and look up the MERC impact.
+4. Add up the impacts. The total is one possible leftover error.
+
+The 100,000 totals form the distribution of $D$. This takes milliseconds and needs no Verisk calls.
+
+> 💡 **Why simulate instead of using a formula?** In most draws nothing is wrong, so the distribution is a tall spike at zero plus a scattered tail. A mean-and-variance summary smooths that shape away and gets the tails wrong, and the tails are exactly what the score is about.
+
+---
+
+## 6. Measuring MERC impact: Option A or Option B
+
+> **In one sentence:** get MERC impacts either from a one-time designed study, with no extra calls per quote, or by asking Verisk directly for the few attributes that matter on each quote.
+
+| | **Option A: No extra calls** | **Option B: A few extra calls** |
+|---|---|---|
+| **Extra Verisk calls per quote** | 0 | 0–3, usually 0–1 |
+| **Where impacts come from** | Lookup table from a one-time study | Verisk, for this exact home |
+| **Precision** | Typical impact for similar homes | Exact for this home |
+| **Upfront work** | Design and run the study | Build a screening rule |
+| **Upkeep** | Refresh the table about once a year | None |
+| **Added latency** | None | None, since the calls run alongside step 5 |
+| **Contract questions** | Storing effects derived from Verisk output | "What-if" calls and per-call cost |
+
+### Option A: No extra calls
+
+**The idea:** run one scientifically designed batch of Verisk calls up front, measure how MERC responds to each attribute change, summarize the results in a lookup table, and use that table on every quote.
+
+#### Study design
+
+| Step | What to do | Why |
+|---|---|---|
+| **1 · Choose base homes** | A stratified sample of 1,000–2,000 homes from the book, by region (state or H3 r4) × size band × stories × construction | Covers the homes we actually quote. Aim for at least 20–30 homes per stratum. |
+| **2 · Change one thing at a time** | For each base home, call once as is, then once per single change: square footage ±10% and ±20%, year built ±10 years, and each plausible alternative for stories, construction, roof, foundation, garage and quality | Isolates each attribute's own effect. About 15 calls per home. |
+| **3 · Test interactions** | On about 200 base homes, change square footage, stories and construction together, at two levels each, in all 8 combinations | Checks that effects really add up, and flags pairs that don't |
+| **4 · Summarize** | For each stratum and change, record the median log-impact and its spread | This is the lookup table |
+
+#### What the table looks like (illustrative)
+
+| Change | Stratum | Median MERC impact | Middle 50% of homes |
+|---|---|:-:|:-:|
+| Square footage (elasticity) | Region A · 1,800–2,500 sq ft · 1-story | 0.85 | 0.80 to 0.89 |
+| 1-story → 2-story, same square footage | Region A · 1,800–2,500 sq ft | −6% | −8% to −4% |
+| Frame → masonry veneer | Region A · all sizes | +5% | +4% to +6% |
+| Shingle → metal roof | Region A · all sizes | +2% | +1% to +3% |
+
+**Budget:** 1,500 base homes × about 15 calls, plus 200 × 8 interaction calls, comes to about **24,000 calls, once**.
+
+> 💡 **Details that make it scientific**
+>
+> - **Store relative effects only** (log-ratios), never MERC levels.
+> - **Check that Verisk is deterministic** by repeating a handful of calls. If it is, no repeat calls are needed, because all the variation is between homes.
+> - **Carry the spread forward.** In the simulation, draw each impact from its stratum's spread instead of always using the median. The table's imprecision then shows up as honest extra uncertainty.
+> - **Smooth thin strata** by borrowing from the parent stratum, the same way H3 cells borrow from their parents.
+
+**Upkeep.** Relative effects drift far more slowly than MERC levels. Refresh the study about once a year, with a small spot check after any major Verisk cost update.
+
+**If the study isn't approved,** use sensitivities from engineering judgment or published construction-cost guides. They're coarser, but contract-safe.
+
+### Option B: A few extra calls
+
+**The idea:** for the one to three not-asked attributes that matter most on *this* quote, ask Verisk directly what MERC would be if that attribute took its most likely alternative value.
+
+**Step 1 · Screen.** Score each not-asked attribute's **materiality**:
+
+$$
+m_k \;=\; (1 - p_k) \times \text{typical } \lvert \Delta_k \rvert
+$$
+
+↳ **In words:** materiality is *the chance it's wrong* times *how much it would matter*. The typical impact comes from the Option A table, or from engineering priors if there's no table.
+
+Only attributes above a threshold get a call, capped at two or three per quote. Most quotes need none.
+
+**Step 2 · Call.** For each selected attribute, call Verisk with the final attributes, changing only that one:
+
+- **Continuous:** one call at a typical "if wrong" value, such as the median correction. Use two calls, one per direction, when corrections go both ways.
+- **Categorical:** one call per likely alternative, usually just one.
+
+**Step 3 · Use.** Plug the exact impacts into the simulation. Every other attribute still uses the table or priors.
+
+> 📌 **In practice:** these calls need only the final attributes, so they can fire **in parallel with the step 5 call** and add no latency. Each one also returns a range, which shows whether Verisk's engine spread shifts across scenarios.
+
+### Which option should we use?
+
+| If… | Then… |
+|---|---|
+| The study is approved and calls are costly | **Option A** |
+| The study isn't approved, but what-if calls are | **Option B**, screening with engineering priors |
+| Neither is approved | **Option A**, built from engineering or published cost-guide sensitivities |
+| We want maximum precision on high-value homes | **Hybrid:** Option A by default, Option B when materiality is high |
+
+---
+
+## 7. Ingredient 2: Engine uncertainty
+
+> **In one sentence:** Verisk's range tells us how precise its estimate is for the right house; we turn it into a spread and fold it into the simulation.
+
+### 7.1 First, confirm what the range means
+
+The range might reflect cost uncertainty only (labor, materials, finish), or it might also include Verisk's own uncertainty about the attributes. That matters, because leftover attribute risk already covers the attributes, and counting them twice would understate confidence.
+
+**A quick test on about 50 homes:** call Verisk once with the prefill as returned, and once with every attribute passed explicitly.
+
+| What happens to the range | What it means | What to do |
+|---|---|---|
+| It **stays the same** | It reflects cost uncertainty only | Use it as is |
+| It **narrows** when attributes are passed | It includes attribute uncertainty | In step 5, always pass every final attribute explicitly, and use that range |
+
+While you're at it, ask Verisk what coverage the range is meant to have, such as 90%.
+
+### 7.2 Turn the range into a spread
+
+$$
+\sigma_V \;=\; \frac{\ln U - \ln L}{2 \times 1.645}
+$$
+
+↳ **In words:** the width of the range on the log scale, divided by the width of a 90% Normal interval. $U$ and $L$ are the top and bottom of the range. Use 1.645 for a 90% range and 1.96 for a 95% range. If Verisk can't state the coverage, start at 90% and revisit.
+
+### 7.3 Combine with leftover attribute risk
+
+For each simulated draw $D_i$, the chance that Verisk's own noise still leaves the MERC in tolerance has a closed form. Averaging across the draws gives the confidence:
+
+$$
+C \;=\; \frac{1}{N}\sum_{i=1}^{N}\left[\,\Phi\!\left(\frac{\tau_{\text{under}} - D_i}{\sigma_V}\right) - \Phi\!\left(\frac{-\tau_{\text{over}} - D_i}{\sigma_V}\right)\right]
+$$
+
+↳ **In words:** for each possible true house, take the chance that engine noise keeps the MERC in tolerance, then average over all the possible houses. $\Phi$ is the standard Normal CDF and $N$ is the number of draws.
+
+> 📌 **In practice:** also keep the **attribute-only** version: the share of draws where $D$ alone is within tolerance. It's the part we can validate directly ([section 11](#11-proving-it-works)).
+
+---
+
+## 8. Ingredient 3: Neighborhood check
+
+> **In one sentence:** if this home's MERC per square foot looks unusual next to similar homes nearby, lower the confidence.
+
+### 8.1 What it catches, and what it doesn't
+
+Because MERC scales with square footage, dividing by square footage mostly **cancels square-footage errors**. A home recorded at 1,800 sq ft that's really 2,400 has a MERC that's too low *and* a square footage that's too low, so its \$/sqft still looks normal. The attribute model's plausibility checks remain the right tool for those.
+
+What the ratio **does** catch:
+
+- Errors in attributes that set **cost per square foot**: quality, construction, stories, expensive features
+- **Odd combinations** of attributes that each look plausible on their own
+- **Member input errors** on confirmed attributes
+- **Quirks in Verisk's engine** itself
+
+That makes it a complement to the attribute model, not a repeat of it.
+
+### 8.2 Build the neighborhood reference with H3
+
+We reuse the H3 hierarchy from the override-rate component of the attribute model: **r7 → r6 → r5 → r4 → state**.
+
+At each level, the home's cell needs two numbers:
+
+- a **center:** the median of log \$/sqft
+- a **spread:** the MAD of log \$/sqft
+
+Small cells are noisy, so each level is blended with the one above it, according to how much data it has:
+
+$$
+\hat\mu_{\text{level}} \;=\; w \cdot m_{\text{level}} \;+\; (1 - w)\cdot\hat\mu_{\text{parent}}, \qquad w = \frac{n}{n + k}
+$$
+
+↳ **In words:** a cell with many homes mostly speaks for itself, and a cell with few homes mostly borrows from its parent. Here $m_{\text{level}}$ is the cell's own median, $n$ is its number of homes, and $\hat\mu_{\text{parent}}$ is the already-blended value from the level above. Start at the state and work down to r7.
+
+> 💡 **What is $k$?** It's the number of homes at which a cell gets **exactly half** the weight. Estimate it once per level with Bühlmann credibility (within-cell variance ÷ between-cell variance), which will be familiar territory for the actuaries.
+
+Blend the spread the same way, using log(MAD) so it stays positive; the standard-deviation equivalent is then $\hat\sigma = 1.4826 \times \text{MAD}$. If the override-rate method uses a different fallback scheme, such as "the finest level with at least N homes," mirror it here for consistency.
+
+### 8.3 Compare like with like
+
+- **Size bands.** \$/sqft falls as homes get bigger, because kitchens, bathrooms and HVAC are partly fixed costs. Run the whole hierarchy separately within three or four size bands, and split coarsely by stories or construction where volume allows.
+- **Same cost basis.** Verisk updates its cost data periodically, so trend older neighbor MERCs to today's cost level, or use recent ones only.
+- **Robust statistics.** Use medians and MADs rather than means and standard deviations, because neighborhoods contain genuine outliers.
+
+> ⚠️ **Watch out:** adjust for size by *stratifying*, not by fitting a curve of \$/sqft against size. Fitting a model with MERC as the outcome is exactly what the contract rules out.
+
+### 8.4 The neighborhood score
+
+$$
+z \;=\; \frac{\ln(\text{MERC} / \text{sq ft}) \;-\; \hat\mu_{r7}}{\hat\sigma_{r7}}
+$$
+
+↳ **In words:** how many typical spreads this home's \$/sqft sits from its blended neighborhood center. A $z$ of −2 means noticeably cheaper per square foot than similar homes nearby.
+
+An outlier explained by attributes the member just confirmed, such as "custom quality, masonry," is less alarming than an unexplained one. Stratifying by quality and construction where volume allows handles most of this automatically.
+
+---
+
+## 9. From probability to High, Medium, Low
+
+> **In one sentence:** $C$ sets the base tier, and the neighborhood score can only lower it.
+
+**Step 1 · Base tier from $C$**
+
+| Confidence $C$ | Base tier |
+|:-:|:-:|
+| 0.90 or more | 🟢 High |
+| 0.70 up to 0.90 | 🟡 Medium |
+| Below 0.70 | 🔴 Low |
+
+**Step 2 · Neighborhood override**
+
+| Neighborhood score | What happens |
+|:-:|---|
+| $\lvert z \rvert \le 2$ | Keep the base tier |
+| $2 < \lvert z \rvert \le 3$ | Drop one tier |
+| $\lvert z \rvert > 3$ | Force 🔴 Low |
+
+These cutoffs are **illustrative starting points**; [section 11](#11-proving-it-works) explains how to set them from data. If we can put rough costs on MERC error (premium leakage, underinsurance exposure) and on inspections, the thresholds on $C$ can come from expected cost instead of judgment.
+
+> 💡 **Why an override instead of one blended number?** It's easy to explain ("the neighborhood check flagged it"), and each part can be tuned and validated on its own.
+
+### Reason codes
+
+Every score should come with its **main driver**: the attribute whose confirmation would raise $C$ the most. To find it, rerun the calculation with each attribute treated as known:
+
+$$
+\text{Lift}_k \;=\; C_{\text{with } k \text{ known}} \;-\; C
+$$
+
+This tells underwriting *why* a MERC is Medium or Low, and which single fact would fix it. That's exactly what's needed to route a quote to inspection.
+
+---
+
+## 10. Worked example
+
+> **In one sentence:** a 1-story, 2,150 sq ft home lands at 🟡 Medium, and the reason is almost entirely square footage.
+
+All numbers are illustrative. Every figure below was computed with the code in [Appendix C](#appendix-c-reference-code).
+
+### The quote
+
+| Quote detail | Value |
+|---|---|
+| **Final MERC** | \$372,000 |
+| **Verisk range (90%)** | \$341,000 to \$405,000 |
+| **Square footage** | 2,150 sq ft, so \$173 per sq ft |
+| **Member confirmed** | Quality grade ("standard") and garage (corrected to 2-car attached) |
+| **Not asked** | Square footage, stories, construction, roof, year built |
+| **Tolerance** | MERC no more than 10% too low, and no more than 15% too high |
+
+### Step 1 · Leftover attribute risk
+
+| Not-asked attribute | $p_k$ | If wrong, it's usually… | MERC impact if wrong | Materiality $m_k$ |
+|---|:-:|---|:-:|:-:|
+| Square footage | 0.86 | 18% larger (55%) or 12% smaller (45%) | +15% or −10% | **0.018** |
+| Stories | 0.93 | 2 stories, not 1 | −6% | 0.004 |
+| Construction | 0.95 | Masonry veneer, not frame | +5% | 0.003 |
+| Roof | 0.96 | Metal, not shingle | +2% | 0.001 |
+| Year built | 0.94 | 10 years older or newer | ±1% | 0.001 |
+
+The square-footage impacts use an elasticity of 0.85 from the sensitivity table.
+
+**What the simulation shows:**
+
+- In **69%** of draws, every not-asked attribute is right, and the leftover error is zero.
+- In **7%** of draws, the MERC is more than 10% too low, because the home is really larger.
+- In **0.4%** of draws, the MERC is more than 15% too high.
+- Attribute-only confidence: **0.92**.
+
+### Step 2 · Engine uncertainty
+
+$$
+\sigma_V \;=\; \frac{\ln 405{,}000 - \ln 341{,}000}{2 \times 1.645} \;=\; 0.052
+$$
+
+That's about ±5% at one standard deviation. Even if every attribute were certain, this home's confidence would top out at **0.97**.
+
+### Step 3 · Confidence and base tier
+
+Combining the two gives **$C$ = 0.893 → 🟡 Medium**, just short of the 0.90 needed for High.
+
+### Step 4 · Neighborhood check
+
+| H3 level | Homes in cell | Cell median \$/sqft | Weight $w$ | Blended center |
+|:-:|--:|--:|:-:|--:|
+| State | 48,000 | \$168 | — | \$168.0 |
+| r4 | 2,400 | \$176 | 0.99 | \$175.9 |
+| r5 | 310 | \$179 | 0.93 | \$178.8 |
+| r6 | 42 | \$184 | 0.63 | \$182.0 |
+| r7 | 9 | \$190 | 0.26 | \$184.1 |
+
+This uses $k = 25$ homes at every level. The r7 cell's own median of \$190 gets only 26% of the weight: with nine homes, it mostly borrows from r6. The blended spread works out to 0.099, or about 10%.
+
+$$
+z \;=\; \frac{\ln 173 - \ln 184.1}{0.099} \;=\; -0.63
+$$
+
+That's well within ±2, so the tier stays 🟡 **Medium**.
+
+### Step 5 · Main driver
+
+| If we had also confirmed… | New $C$ | Lift |
+|---|:-:|:-:|
+| **Square footage** | **0.961** 🟢 | **+0.068** |
+| Construction | 0.899 | +0.006 |
+| Roof, year built or stories | 0.893 to 0.894 | under 0.002 |
+
+> 💡 **The takeaway:** square footage cleared the attribute threshold at 86%, but it's also the attribute MERC is most sensitive to. Surfacing that combination is exactly what this score is for. Over time, reason codes like this one show which attributes most often hold MERC confidence back. That's useful evidence if the step 4 thresholds are ever revisited.
+
+### What the output looks like
+
+| Field | Value |
+|---|---|
+| **MERC** | \$372,000 (Verisk range \$341,000 to \$405,000) |
+| **Confidence** | 0.893 → 🟡 **Medium** |
+| **Neighborhood check** | \$173/sqft vs. \$184 nearby (z = −0.6), no flag |
+| **Main driver** | Square footage: not asked, 86% confident. Confirming it would raise confidence to 0.961 🟢 |
+
+### The Option B version
+
+Only square footage clears a materiality threshold of, say, 0.005, so Option B spends **two calls**: one at 2,537 sq ft (18% larger) and one at 1,892 sq ft (12% smaller). Suppose Verisk returns \$423,500 and \$332,000:
+
+| | Option A (table) | Option B (calls) |
+|---|:-:|:-:|
+| Impact if 18% larger | +15.1% | +13.8% |
+| Impact if 12% smaller | −10.3% | −10.8% |
+| Confidence $C$ | 0.893 🟡 | 0.896 🟡 |
+
+The exact calls show the familiar economies of scale: a bigger home adds a little less than the table assumed, and a smaller home loses a little more. The tier doesn't change, which is typical. Option B matters most when a home is unusual for its stratum.
+
+### What if the \$/sqft had looked off?
+
+| If MERC per sq ft were… | $z$ | Result |
+|---|:-:|---|
+| \$173 (actual) | −0.6 | No change: 🟡 Medium |
+| \$150 | −2.1 | Drop one tier: 🔴 Low |
+| \$130 | −3.5 | Force 🔴 Low |
+
+---
+
+## 11. Proving it works
+
+> **In one sentence:** compare predicted confidence with what actually happens on a random audit sample, and fix gaps by adjusting the inputs, never by fitting a model on MERC.
+
+### 11.1 Where the truth comes from
+
+| Source | Quality | Notes |
+|---|:-:|---|
+| **Audit arm** | Good | A random 2–5% of quotes where every material attribute is asked. Ideally the prefill value isn't shown, since people anchor on what they see. |
+| **Post-bind inspections** | Best | Where available |
+| **Normal member corrections** | Biased | We only see corrections on the attributes we asked about |
+
+> ⚠️ **Why the audit arm matters:** in the normal flow we never ask about high-confidence attributes, so we never learn when they were wrong, and those are exactly the errors this score predicts. The audit arm is the only unbiased view.
+
+### 11.2 What we can check
+
+For each audit quote we know both the attributes the normal flow *would* have used and the fully confirmed ones. One extra Verisk call per audit quote gives the **realized leftover error**:
+
+$$
+D_{\text{realized}} \;=\; \ln \text{MERC}_{\text{fully confirmed}} \;-\; \ln \text{MERC}_{\text{normal flow}}
+$$
+
+Engine error is different. It's only observable in rare total losses, so that part of the score rests on Verisk's stated range.
+
+| Check | What good looks like |
+|---|---|
+| **Calibration** | Among quotes with attribute-only confidence near 0.80, about 80% have $D_{\text{realized}}$ within tolerance |
+| **Tier separation** | Realized errors grow clearly from High to Medium to Low |
+| **Neighborhood override** | Flagged quotes show larger realized errors than unflagged quotes in the same base tier |
+| **Beats simple baselines** | Outperforms "product of the $p_k$" and "gap between the prefill and MLE MERCs" |
+
+### 11.3 Fixing miscalibration
+
+Adjust the inputs, never a MERC model:
+
+| Symptom | Likely fix |
+|---|---|
+| Errors are bigger than predicted across the board | Correction profiles are too narrow, or attribute confidences are too high |
+| Errors pile up on the same homes | Add correlation between attribute errors ([section 14](#14-known-limitations)) |
+| One attribute keeps surprising us | Revisit its sensitivity or its screening threshold |
+| Too many or too few quotes land in High | Revisit the tolerances and tier cutoffs |
+
+### 11.4 Monitoring
+
+Review the tier mix, audit results and override rate every quarter, and again after every Verisk data update.
+
+---
+
+## 12. Contract checkpoints
+
+> **In one sentence:** confirm five things with the owner of the Verisk agreement before building.
+
+| # | Question to confirm | Needed for | If the answer is no |
+|:-:|---|---|---|
+| 1 | Are hypothetical "what-if" calls permitted, and how are they priced? | Option B, and the Option A study | Option A with engineering sensitivities |
+| 2 | May we store relative effects (log-ratios) derived from a designed batch of calls? | Option A | Engineering or published cost-guide sensitivities |
+| 3 | May we aggregate stored MERCs across properties into neighborhood \$/sqft references? | Neighborhood check | External regional \$/sqft benchmarks |
+| 4 | May realized MERC differences be used to **evaluate** (not train) the score? | Validation | Validate at the attribute level only |
+| 5 | What does per-call pricing mean for each option? | Everything | — |
+
+> ⚖️ **Design principle:** nothing here fits a model with MERC as the outcome. MERC is only ever *looked up* (final and what-if calls) or *compared* (the neighborhood check and validation). Whether that satisfies the agreement is for its owner to confirm.
+
+---
+
+## 13. Rollout plan
+
+| Phase | What ships | Extra calls per quote |
+|---|---|:-:|
+| **1 · Launch** | Leftover-risk simulation (Option A, or engineering sensitivities while the study is pending) · engine spread · neighborhood check · provisional tiers · **audit arm starts on day one** | 0 |
+| **2 · Calibrate** | Tolerances and cutoffs set from audit data · Option B for high-materiality or high-value homes · reason codes in underwriting · Low routed to inspection | 0–3, on a subset |
+| **3 · Refine** | Correlated attribute errors in the simulation · annual study refresh · monitoring dashboard | Unchanged |
+
+---
+
+## 14. Known limitations
+
+- **Errors are treated as independent.** In reality they cluster: a mismatched parcel breaks several attributes at once, and an unrecorded addition raises square footage and bathrooms together. The property-level Verisk score in the attribute model captures some of this. Later, we can measure how often errors co-occur in the book and add that to the simulation, without changing the attribute model.
+- **Adding up impacts is an approximation.** The study's interaction test measures how good it is. Square footage × stories is the usual suspect, since footprint drives roof and foundation cost.
+- **Members aren't perfect.** Confirmed attributes are treated as known, but people misremember square footage and some understate it. A small member-error rate from the audit arm can be added later.
+- **Engine error is taken on trust.** We rarely observe it directly, so it rests on Verisk's range and its stated coverage.
+
+---
+
+## Appendix A: Notation cheat sheet
+
+| Symbol | Plain English | Comes from |
+|:-:|---|---|
+| $p_k$ | Confidence that attribute $k$'s prefill value is correct | Attribute model (step 3) |
+| $W_k$ | 1 if attribute $k$ is actually wrong, 0 if not | Simulated: 1 with probability $1 - p_k$ |
+| $\Delta_k$ | Change in log-MERC if attribute $k$ took its corrected value | Option A table or Option B call |
+| $e_k$ | Elasticity: % change in MERC per % change in a continuous attribute | Option A table or Option B call |
+| $D$ | Leftover attribute error | Simulation |
+| $\varepsilon_V$ | Engine error | Verisk |
+| $\sigma_V$ | Spread of the engine error | Verisk's range |
+| $E$ | Total error, $D + \varepsilon_V$ | Both of the above |
+| $\tau_{\text{under}}, \tau_{\text{over}}$ | How far too low or too high the MERC may be | Business decision |
+| $C$ | MERC confidence: the chance $E$ is within tolerance | This method |
+| $m_k$ | Materiality: chance wrong × typical impact | Option B screening |
+| $w, k$ | Blending weight, and the cell size that earns half the weight | H3 neighborhood reference |
+| $z$ | Neighborhood \$/sqft score | H3 neighborhood reference |
+
+---
+
+## Appendix B: Where the MLE and prefill MERC calls fit
+
+The original idea used three Verisk calls: prefill attributes, the attribute model's most likely (MLE) attributes, and final attributes. Here's where each lands in this design.
+
+| Call | What it actually measures | Role here |
+|---|---|---|
+| **Final attributes** | The MERC we quote, plus Verisk's range | **Core:** it feeds the score |
+| **MLE attributes** | For not-asked attributes, the most likely value *is* the prefill, so this mostly duplicates the final call. It differs only where a member's answer disagrees with the model's best guess. | **Optional diagnostic:** a flag for possible member error |
+| **Prefill attributes** | How much the questions moved MERC | **Monitoring:** shows the value of asking, but it measures uncertainty already resolved, not what's left |
+
+---
+
+## Appendix C: Reference code
+
+A minimal implementation of every calculation in this document. Running it reproduces the worked example.
+
+```python
+import numpy as np
+from scipy.stats import norm
+
+
+def engine_spread(low, high, z=1.645):
+    """Verisk's range as a log-scale spread. z = 1.645 for a 90% range, 1.96 for 95%."""
+    return np.log(high / low) / (2 * z)
+
+
+def merc_confidence(not_asked, sigma_v, tol_under=0.10, tol_over=0.15,
+                    n_draws=100_000, seed=7):
+    """
+    Chance that the final MERC is within tolerance of the true rebuild cost.
+
+    not_asked: one dict per attribute the member was NOT asked about
+        p_correct : confidence from the attribute model (step 3)
+        impacts   : change in log-MERC for each 'if wrong' value
+        weights   : how often each 'if wrong' value occurs (sums to 1)
+    sigma_v: engine spread from engine_spread()
+    """
+    rng = np.random.default_rng(seed)
+    D = np.zeros(n_draws)                                   # leftover attribute error
+    for a in not_asked:
+        wrong = rng.random(n_draws) > a["p_correct"]        # weighted coin flip
+        pick = rng.choice(len(a["impacts"]), size=n_draws, p=a["weights"])
+        D += wrong * np.asarray(a["impacts"])[pick]         # add the impact if wrong
+    in_tol = norm.cdf((tol_under - D) / sigma_v) - norm.cdf((-tol_over - D) / sigma_v)
+    return in_tol.mean()
+
+
+def main_driver(not_asked, sigma_v, **kw):
+    """Lift in C from treating each not-asked attribute as known."""
+    base = merc_confidence(not_asked, sigma_v, **kw)
+    lifts = {}
+    for i, a in enumerate(not_asked):
+        known = [dict(b, p_correct=1.0) if j == i else b for j, b in enumerate(not_asked)]
+        lifts[a["name"]] = merc_confidence(known, sigma_v, **kw) - base
+    return max(lifts, key=lifts.get), lifts
+
+
+def neighborhood_reference(cells, k=25):
+    """
+    Blend the median and MAD of log $/sqft down the H3 hierarchy, within one size band.
+    cells: ordered state, r4, r5, r6, r7; each has n, median and mad on the log scale.
+    """
+    mu, log_mad = cells[0]["median"], np.log(cells[0]["mad"])
+    for c in cells[1:]:
+        w = c["n"] / (c["n"] + k)
+        mu = w * c["median"] + (1 - w) * mu
+        log_mad = w * np.log(c["mad"]) + (1 - w) * log_mad
+    return mu, 1.4826 * np.exp(log_mad)
+
+
+def tier(c, z, high=0.90, low=0.70):
+    """Base tier from C, then the neighborhood override, which can only lower it."""
+    level = 2 if c >= high else 1 if c >= low else 0
+    if abs(z) > 3:
+        level = 0
+    elif abs(z) > 2:
+        level = max(level - 1, 0)
+    return ["Low", "Medium", "High"][level]
+
+
+# ---- Worked example ----------------------------------------------------------
+sigma_v = engine_spread(341_000, 405_000)
+e_sqft = 0.85                                               # elasticity from the table
+not_asked = [
+    {"name": "square footage", "p_correct": 0.86,
+     "impacts": [e_sqft * np.log(1.18), e_sqft * np.log(0.88)], "weights": [0.55, 0.45]},
+    {"name": "stories",      "p_correct": 0.93, "impacts": [-0.06],       "weights": [1.0]},
+    {"name": "construction", "p_correct": 0.95, "impacts": [0.05],        "weights": [1.0]},
+    {"name": "roof",         "p_correct": 0.96, "impacts": [0.02],        "weights": [1.0]},
+    {"name": "year built",   "p_correct": 0.94, "impacts": [0.01, -0.01], "weights": [0.5, 0.5]},
+]
+C = merc_confidence(not_asked, sigma_v)
+
+cells = [  # size band 1,800-2,500 sq ft
+    {"n": 48_000, "median": np.log(168), "mad": 0.110},    # state
+    {"n": 2_400,  "median": np.log(176), "mad": 0.090},    # r4
+    {"n": 310,    "median": np.log(179), "mad": 0.080},    # r5
+    {"n": 42,     "median": np.log(184), "mad": 0.070},    # r6
+    {"n": 9,      "median": np.log(190), "mad": 0.050},    # r7
+]
+mu, sd = neighborhood_reference(cells)
+z = (np.log(372_000 / 2_150) - mu) / sd
+
+driver, lifts = main_driver(not_asked, sigma_v)
+print(f"C = {C:.3f}   z = {z:.2f}   tier = {tier(C, z)}   main driver = {driver}")
+# C = 0.893   z = -0.63   tier = Medium   main driver = square footage
+```
