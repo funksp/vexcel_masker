@@ -1,0 +1,685 @@
+# MERC Confidence Score: Four-Signal Method
+
+*How much to trust the Minimum Estimated Rebuild Cost, built from four signals we already have*
+
+**Status:** Proposed method  ·  **Date:** September 2026  ·  **Audience:** Data Science, Actuarial, Product, Underwriting
+
+**Related documents:** this method replaces the interim \$/sqft method, which becomes one of its four signals. The full attribute-level method remains the long-term recommendation, pending contractual approval from Verisk.
+
+---
+
+## TL;DR
+
+At the end of the quote flow, every MERC gets a confidence label: 🟢 **High**, 🟡 **Medium** or 🔴 **Low**. The label answers one question:
+
+> **What is the chance that the final MERC is close enough to the true cost to rebuild?**
+
+It's built from four signals, and each one answers a simple question:
+
+| | Signal | The question it answers |
+|:-:|---|---|
+| **1** | **Prefill MERC and range** | If the member's changes were wrong, where would the MERC be? |
+| **2** | **Final MERC and range** | How precise is Verisk for the house we're quoting? |
+| **3** | **Verisk Property Confidence Score** (1–5) | How much could still be wrong in the attributes we didn't ask about? |
+| **4** | **H3 neighborhood estimate** | Does a second opinion from similar homes nearby agree? |
+
+**How they combine, in one breath:** Signals 2 and 3 set how uncertain the final MERC is. Signal 4 pulls our best guess of the true cost toward the neighborhood, and the pull is stronger the more uncertain Verisk is. Signal 1 adds a "what if the member was wrong" version of the house. The result is one probability, which sets the tier.
+
+| | |
+|---|---|
+| **Verisk calls** | No hypothetical calls and no studies. It uses the prefill and final MERCs from the quote flow. |
+| **Models trained on MERC** | None. MERC is only ever *compared*, never predicted. |
+| **Output** | A tier, the confidence behind it, and the main driver in plain English |
+
+> **Nothing upstream changes.** The attribute confidence model and the question logic stay exactly as they are. The score is a new step at the end.
+
+---
+
+## Contents
+
+1. [Where the signals come from](#1-where-the-signals-come-from)
+2. [What confidence means](#2-what-confidence-means)
+3. [The idea at a glance](#3-the-idea-at-a-glance)
+4. [The four signals](#4-the-four-signals)
+5. [Putting it together](#5-putting-it-together)
+6. [From confidence to High, Medium, Low](#6-from-confidence-to-high-medium-low)
+7. [Worked examples](#7-worked-examples)
+8. [Setting the parameters](#8-setting-the-parameters)
+9. [Proving it works](#9-proving-it-works)
+10. [Edge cases](#10-edge-cases)
+11. [Contract checkpoints](#11-contract-checkpoints)
+12. [Rollout plan](#12-rollout-plan)
+13. [Known limitations](#13-known-limitations)
+
+**Appendices:** [A · Notation cheat sheet](#appendix-a-notation-cheat-sheet)  ·  [B · Reference code](#appendix-b-reference-code)
+
+---
+
+## 1. Where the signals come from
+
+> **In one sentence:** three signals come from Verisk during the quote flow, the fourth comes from our book, and the score is a new step 6.
+
+```mermaid
+flowchart LR
+    S1["1 · Address"] --> S2["2 · Verisk prefill<br/><b>Signals 1 + 3</b>"]
+    S2 --> S3["3 · Attribute<br/>confidence model"]
+    S3 --> S4["4 · Ask about<br/>low-confidence attributes"]
+    S4 --> S5["5 · Final Verisk call<br/><b>Signal 2</b>"]
+    S5 --> S6["6 · MERC confidence<br/>High / Medium / Low"]
+    BOOK["Our book · H3 $/sqft reference<br/><b>Signal 4</b>"] --> S6
+
+    classDef existing fill:#F1F5F9,stroke:#94A3B8,color:#0F172A
+    classDef new fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#0F172A
+    class S1,S2,S3,S4,S5,BOOK existing
+    class S6 new
+```
+
+| Quote-flow step | What happens | What it gives the score |
+|:-:|---|---|
+| 1 | Member provides their address | — |
+| 2 | Verisk returns prefilled attributes, a prefill MERC and range, and the Property Confidence Score | **Signals 1 and 3** |
+| 3 | Our model scores confidence in each attribute | — |
+| 4 | Member confirms or corrects the low-confidence attributes | — |
+| 5 | Verisk returns the final MERC and range, using the member's answers | **Signal 2** |
+| **6** | **MERC confidence score** | **New** |
+
+Signal 4 comes from a neighborhood reference built ahead of time from our book and refreshed on a schedule. Wherever this document says **"quote-flow step N,"** it means a step in this table.
+
+---
+
+## 2. What confidence means
+
+> **In one sentence:** confidence is the probability that the final MERC lands within an agreed tolerance of the true rebuild cost.
+
+The tolerance says how far off the MERC may be and still count as right. It's **asymmetric** on purpose:
+
+- A MERC that's **too low** leaves the home underinsured and leaks premium. Keep this side tight.
+- A MERC that's **too high** makes the quote less competitive. This side can be looser.
+
+$$
+C \;=\; P\big(-\tau_{\text{over}} \;\le\; \ln(\text{true cost}) - \ln(\text{final MERC}) \;\le\; \tau_{\text{under}}\big)
+$$
+
+↳ **In words:** $C$ is the chance that the MERC is no more than $\tau_{\text{under}}$ too low and no more than $\tau_{\text{over}}$ too high.
+
+This document uses $\tau_{\text{under}} = 0.10$ and $\tau_{\text{over}} = 0.15$, about 10% and 15%, for illustration. The real values are a business decision.
+
+> 💡 **Why logs?** On the log scale, a difference of 0.05 is about 5%, and multiplying effects become adding effects. Tables in this document show percentages; the math underneath runs on logs.
+
+---
+
+## 3. The idea at a glance
+
+> **In one sentence:** score two versions of the house, one where the member was right and one where they were wrong, and average them.
+
+```mermaid
+flowchart TD
+    FIN["Signal 2<br/>Final MERC + range"]
+    PCS["Signal 3<br/>Property Confidence Score"]
+    NB["Signal 4<br/>H3 neighborhood estimate"]
+    PRE["Signal 1<br/>Prefill MERC + range"]
+
+    RIGHT["If the member was right<br/>weight 1 − q"]
+    WRONG["If the member was wrong<br/>weight q"]
+
+    FIN --> RIGHT
+    PCS --> RIGHT & WRONG
+    NB --> RIGHT & WRONG
+    PRE --> WRONG
+
+    RIGHT --> C["Confidence C<br/>weighted average"]
+    WRONG --> C
+    C --> OUT["Tier + guardrails<br/>+ main driver"]
+
+    classDef signal fill:#F1F5F9,stroke:#94A3B8,color:#0F172A
+    classDef version fill:#FFFFFF,stroke:#64748B,color:#0F172A
+    classDef result fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#0F172A
+    class PRE,FIN,PCS,NB signal
+    class RIGHT,WRONG version
+    class C,OUT result
+```
+
+For each version of the house, the score asks the same three questions:
+
+1. **Where is the true cost probably centered?** Start at that version's MERC, then let the neighborhood estimate pull it a little.
+2. **How spread out is it?** Combine Verisk's range with the leftover data risk from the Property Confidence Score.
+3. **What's the chance the quote lands within tolerance?** A standard Normal calculation.
+
+The final confidence is the weighted average of the two versions. When the member changed nothing, both versions are the same house and the average is just that one answer.
+
+---
+
+## 4. The four signals
+
+### Signal 1 · Prefill MERC and range
+
+> **What it answers:** if the member's changes were wrong, where would the MERC be?
+
+The prefill MERC prices the house exactly as Verisk's records describe it. The final MERC prices it as the member described it. The gap between them is how much the quote now rests on the member's word:
+
+$$
+s \;=\; \ln\!\left(\frac{\text{final MERC}}{\text{prefill MERC}}\right)
+$$
+
+Members are usually right, but not always. They misremember square footage, and some understate it. If the member's changes were wrong, our best alternative guess of the house is the prefill version. So the prefill MERC and its range define the **"member was wrong"** version of the house, weighted by $q$, the chance that the member's changes are wrong ([section 8](#8-setting-the-parameters)).
+
+**Direction matters, and the tolerance handles it automatically:**
+
+| Member's changes… | If they were wrong… | Effect on confidence |
+|---|---|---|
+| **Lowered** the MERC | The true cost is higher than the quote, on the **tight** "too low" side | Can be large |
+| **Raised** the MERC | The true cost is lower than the quote, on the **loose** "too high" side | Usually small |
+| Changed nothing | Both versions are the same house | None |
+
+A final MERC that falls **outside the prefill range** is worth mentioning in the reason code: the member's changes moved the MERC further than Verisk's own stated uncertainty.
+
+### Signal 2 · Final MERC and range
+
+> **What it answers:** how precise is Verisk for the house we're quoting?
+
+The range Verisk returns with the final MERC describes its own precision. We convert it into a log-scale spread:
+
+$$
+\sigma_{V} \;=\; \frac{\ln U - \ln L}{2 \times 1.645}
+$$
+
+↳ **In words:** the width of the range on the log scale, divided by the width of a 90% Normal interval. $U$ and $L$ are the top and bottom of the range.
+
+The prefill range is converted the same way, and serves as the spread for the "member was wrong" version.
+
+> 📌 **Documented assumption:** Verisk's ranges are treated as **90% ranges**. The direction of the error if that's wrong:
+>
+> | If the ranges are really… | Effect |
+> |:-:|---|
+> | 95% ranges | We understate confidence (the safe side) |
+> | 80% ranges | We overstate confidence |
+>
+> If the ranges also include some of Verisk's uncertainty about the attributes, we count that twice, which also lands on the safe side.
+
+### Signal 3 · Property Confidence Score
+
+> **What it answers:** how much could still be wrong in the attributes we didn't ask about?
+
+After the quote flow, the attributes we *asked* about are confirmed, but the rest still rest on Verisk's records. The Property Confidence Score (PCS) is Verisk's own rating of how reliable those records are for this home. A low PCS means more of what we didn't ask about could still be wrong: a mismatched parcel, an unrecorded addition, stale data.
+
+We turn it into a **leftover data risk** $\sigma_D$, an extra spread added on top of Verisk's range:
+
+| PCS | Meaning (assumed) | Leftover data risk $\sigma_D$ (starting value) |
+|:-:|---|:-:|
+| 5 | Most reliable record | 0.020 |
+| 4 | | 0.035 |
+| 3 | | 0.050 |
+| 2 | | 0.080 |
+| 1 | Least reliable record | 0.120 |
+
+These starting values are judgment. [Section 8](#8-setting-the-parameters) shows how to replace them with values measured from our own quotes.
+
+> 💡 **Isn't PCS already in the attribute model?** Yes, but for a different job. There it helps decide *which questions to ask*. Here it measures *what's left after asking*. The calibration in section 8 measures the leftover risk directly, after questions have been asked, so the two uses don't double-count.
+
+> 📌 **Documented assumption:** 5 is the most reliable record and 1 the least. Confirm this against Verisk's documentation.
+
+### Signal 4 · H3 neighborhood estimate
+
+> **What it answers:** does a second opinion from similar homes nearby agree?
+
+From our book, we know the typical MERC per square foot for similar homes nearby. Multiply that by this home's square footage, and we get an independent-ish **neighborhood estimate** of the rebuild cost:
+
+$$
+N \;=\; \underbrace{e^{\hat\mu}}_{\text{typical \$/sqft nearby}} \times \text{square footage}
+$$
+
+The neighborhood reference is built exactly as in the interim method:
+
+- **Recent bound policies**, one row per property, using final MERC and final square footage.
+- **Separately by size band** (under 1,800; 1,800–2,500; 2,500–3,500; 3,500+ sq ft), because \$/sqft falls as homes get bigger.
+- **Median and MAD of log \$/sqft** in every H3 cell, blended from the state down to r7 with credibility weights $w = n/(n+k)$, starting with $k = 25$.
+- **The spread** $\sigma_N = 1.4826 \times$ the blended MAD: how much similar homes nearby typically vary.
+- **Refreshed** monthly or quarterly, and after every Verisk cost-data update.
+
+Each version of the house gets its own neighborhood estimate, using its own square footage. If the member's square-footage change crosses a size band, each version uses its own band's reference.
+
+> ⚠️ **Watch out:** the neighborhood estimate scales with square footage, so it **can't catch square-footage errors**. Those cancel out, exactly as in the interim method. It catches errors in *cost per square foot*: quality, stories, construction, features.
+
+---
+
+## 5. Putting it together
+
+> **In one sentence:** for each version of the house, combine the spreads, let the neighborhood pull the center, compute the chance of landing in tolerance, then average the two versions.
+
+The same four steps run for each version. The notation uses the "member was right" version; the "member was wrong" version swaps in the prefill MERC, range and square footage.
+
+### Step 1 · Total uncertainty
+
+$$
+\sigma \;=\; \sqrt{\sigma_V^2 + \sigma_D^2}
+$$
+
+↳ **In words:** Verisk's own imprecision and the leftover data risk add up, as independent uncertainties do.
+
+### Step 2 · The neighborhood pull
+
+The MERC and the neighborhood estimate are two opinions about the same house. The standard way to combine two estimates is to weight each by how precise it is. The weight on the neighborhood, which we call the **pull**, is:
+
+$$
+w \;=\; \frac{\sigma^2}{\sigma^2 + \sigma_N^2}
+$$
+
+↳ **In words:** when Verisk is sure (a narrow range and a high PCS), the pull is small and the MERC mostly stands on its own. When Verisk is unsure, the neighborhood gets more say.
+
+The center of the true cost, measured as an offset from the quoted MERC, then becomes:
+
+$$
+\delta \;=\; \underbrace{\ln\!\left(\frac{\text{this version's MERC}}{\text{quoted MERC}}\right)}_{\text{0 for the "member was right" version}} \;+\; w \,\ln\!\left(\frac{N}{\text{this version's MERC}}\right)
+$$
+
+> 💡 **Disagreement costs confidence; agreement doesn't earn it.** The neighborhood can *move the center*, but it never *narrows the spread*. Neighbors' MERCs come from the same Verisk engine, so if Verisk is off for a whole area, neighbors will agree with a wrong MERC. Treating their agreement as extra evidence would make the score overconfident.
+
+### Step 3 · Chance of landing in tolerance
+
+$$
+c \;=\; \Phi\!\left(\frac{\tau_{\text{under}} - \delta}{\sigma}\right) - \Phi\!\left(\frac{-\tau_{\text{over}} - \delta}{\sigma}\right)
+$$
+
+↳ **In words:** with the true cost centered $\delta$ away from the quote and spread by $\sigma$, this is the share of the bell curve that falls inside the tolerance window. $\Phi$ is the standard Normal CDF.
+
+### Step 4 · Average the two versions
+
+$$
+C \;=\; (1 - q)\, c_{\text{member right}} \;+\; q\, c_{\text{member wrong}}
+$$
+
+↳ **In words:** the final confidence weights the two versions by how likely each is. If the member changed nothing, $q$ is set to 0, and $C$ is just the "member was right" answer.
+
+---
+
+## 6. From confidence to High, Medium, Low
+
+> **In one sentence:** $C$ sets the tier, two guardrails can lower it, and every tier comes with its main driver.
+
+### The tiers
+
+| Confidence $C$ | Tier |
+|:-:|:-:|
+| 0.90 or more | 🟢 High |
+| 0.70 up to 0.90 | 🟡 Medium |
+| Below 0.70 | 🔴 Low |
+
+These cutoffs are **illustrative starting points**, set properly in shadow mode ([section 12](#12-rollout-plan)).
+
+### Two guardrails
+
+Each guardrail can only *lower* the tier, and caps it at 🟡 Medium:
+
+| Guardrail | Rule | Why |
+|---|---|---|
+| **Thin neighborhood** | Fewer than 30 comparable homes in the home's r5 cell | The neighborhood estimate is mostly borrowed from far away, so we can't vouch for it |
+| **Extreme outlier** | \$/sqft more than 3 spreads from the neighborhood center: $\lvert z \rvert > 3$, where $z = \ln(\text{\$/sqft} / e^{\hat\mu}) / \sigma_N$ | When Verisk's range is very tight, the pull is small, so even a wild outlier barely moves $C$. This catches it. |
+
+### The main driver: a confidence waterfall
+
+To explain *why* a quote landed where it did, build the confidence one signal at a time:
+
+| Step | What's included |
+|---|---|
+| **Start** | 100% |
+| **Final MERC range** | Verisk's precision only: the best this quote could possibly score |
+| **+ Property Confidence Score** | Adds the leftover data risk |
+| **+ Neighborhood estimate** | Adds the neighborhood pull |
+| **+ Prefill vs. final** | Adds the "member was wrong" version, giving the final $C$ |
+
+The step with the biggest drop is the **main driver**. It turns into a plain-English reason:
+
+| Main driver | Example reason |
+|---|---|
+| Final MERC range | Verisk's range is wide (±9%) |
+| Property Confidence Score | Verisk's data on this home is rated 3 of 5 |
+| Neighborhood estimate | \$154/sq ft vs. \$184 typical nearby (−16%) |
+| Prefill vs. final | Member changes lowered MERC 25%, below Verisk's prefill range |
+
+### What to do with each tier (suggested)
+
+| Tier | Suggested action |
+|:-:|---|
+| 🟢 High | None |
+| 🟡 Medium | Log the reason; optionally include it in underwriting review |
+| 🔴 Low | Route to underwriting review, or prioritize for post-bind inspection |
+
+---
+
+## 7. Worked examples
+
+> **In one sentence:** three homes, each landing in a different tier for a different reason.
+
+All numbers are illustrative. Every figure below was computed with the code in [Appendix B](#appendix-b-reference-code). All three homes share one neighborhood reference: size band 2 (1,800–2,500 sq ft), with a typical **\$184.1/sq ft** and a spread of **0.099** (about 10%).
+
+### Home 1 in detail: 🟡 Medium
+
+**The quote**
+
+| | Prefill (quote-flow step 2) | Final (quote-flow step 5) |
+|---|--:|--:|
+| **Square footage** | 1,950 | 2,150 (member corrected it) |
+| **MERC** | \$335,000 | \$372,000 |
+| **Verisk range** | \$306,000 to \$367,000 | \$341,000 to \$405,000 |
+| **Range as a spread** $\sigma_V$ | 0.055 | 0.052 |
+| **\$/sqft** | \$171.8 | \$173.0 |
+| **Neighborhood estimate** $N$ | \$359,000 | \$395,800 |
+
+- **Property Confidence Score:** 3, so the leftover data risk is $\sigma_D$ = 0.05.
+- **Member's change:** MERC up **11%**, just above the top of the prefill range.
+- **Neighborhood check:** \$173 vs. \$184 typical, so $z$ = −0.63. Well within normal.
+
+**The two versions**
+
+| | If the member was right | If the member was wrong |
+|---|:-:|:-:|
+| **Weight** | 90% | 10% |
+| **Total uncertainty** $\sigma$ | 0.072 | 0.075 |
+| **Neighborhood pull** $w$ | 0.35 | 0.36 |
+| **Center of the true cost vs. the quote** | +2.2% | −7.7% |
+| **Chance the quote is within tolerance** | 85.2% | 82.0% |
+
+- **If the member was right**, the true cost is centered on \$372,000, pulled 2.2% up toward the neighborhood's \$395,800.
+- **If the member was wrong**, it's centered on the prefill's \$335,000, pulled up toward \$359,000. That's 7.7% below the quote, on the loose "too high" side, so the damage is small.
+
+$$
+C \;=\; 0.90 \times 0.852 \;+\; 0.10 \times 0.820 \;=\; 0.848 \;\;\rightarrow\;\; \text{🟡 Medium}
+$$
+
+Neither guardrail applies: the r5 cell has 310 homes, and $\lvert z \rvert$ is well under 3.
+
+**The waterfall**
+
+| Step | Confidence | Change |
+|---|:-:|:-:|
+| Start | 100% | |
+| Final MERC range | 97.0% | −3.0 |
+| + Property Confidence Score | 89.8% | **−7.3** ← main driver |
+| + Neighborhood estimate | 85.2% | −4.6 |
+| + Prefill vs. final | 84.8% | −0.3 |
+
+**Output:** 🟡 **Medium** (0.848). *Main driver: Verisk's data on this home is rated 3 of 5. Also: member changes raised MERC 11%, above Verisk's prefill range.*
+
+> 💡 **Notice:** the member moved the MERC outside Verisk's prefill range, yet that costs only 0.3 points, because the move was *upward*. If it had been downward, it would have mattered far more, as Home 3 shows.
+
+### Three homes side by side
+
+| | **Home 1** | **Home 2** | **Home 3** |
+|---|:-:|:-:|:-:|
+| **Property Confidence Score** | 3 | 5 | 2 |
+| **Member's changes** | Square footage up | None | Square footage down, quality lowered to economy |
+| **Prefill → final MERC** | \$335,000 → \$372,000 | \$380,000 (no change) | \$400,000 → \$300,000 |
+| **Change** | +11% | 0% | **−25%**, below the prefill range |
+| **Final range** | \$341,000 to \$405,000 | \$352,000 to \$410,000 | \$272,000 to \$331,000 |
+| **\$/sqft vs. \$184 typical** | \$173 ($z$ = −0.6) | \$185 ($z$ = +0.1) | \$154 ($z$ = −1.8) |
+| **Final MERC range** | 97.0% | 98.4% | 94.7% |
+| **+ Property Confidence Score** | 89.8% | 97.5% | 77.5% |
+| **+ Neighborhood estimate** | 85.2% | 97.6% | 52.9% |
+| **+ Prefill vs. final** | 84.8% | 97.6% | 47.9% |
+| **Tier** | 🟡 **Medium** | 🟢 **High** | 🔴 **Low** |
+| **Main driver** | Property Confidence Score | Final MERC range | Neighborhood estimate |
+
+- **Home 2** is the clean case: a top-rated record, no changes, and a \$/sqft right at the neighborhood's typical. Its main cost is Verisk's own range.
+- **Home 3** is the case this score exists for:
+  - A low-rated record (PCS 2) sets a wide spread, so the neighborhood gets a strong pull ($w$ = 0.50).
+  - The neighborhood says the home should cost about 20% more than quoted, which drags the center close to the tight "too low" limit.
+  - The member *lowered* the MERC by 25%. If they were wrong, the quote is about 34% too low, and that version has only a 2.5% chance of landing in tolerance.
+  - On its own, Home 3's \$/sqft ($z$ = −1.8) would only have been 🟡 Medium under the interim method. Combining the signals is what makes it 🔴 Low.
+
+### The guardrails in action
+
+| Variation | $C$ | Tier before guardrails | Final tier | Why |
+|---|:-:|:-:|:-:|---|
+| Home 2, but only 12 comparable homes in its r5 cell | 0.976 | 🟢 High | 🟡 **Medium** | Thin neighborhood |
+| Home 2, but MERC \$518,000 (\$253/sq ft, $z$ = +3.2) | 0.952 | 🟢 High | 🟡 **Medium** | Extreme outlier: Verisk's tight range kept the pull small |
+
+---
+
+## 8. Setting the parameters
+
+> **In one sentence:** every parameter has a documented starting value and a way to replace it with evidence, and none of them requires a model trained on MERC.
+
+| Parameter | Starting value | How to set it properly | Data needed |
+|---|:-:|---|---|
+| **Tolerances** $\tau_{\text{under}}$, $\tau_{\text{over}}$ | 0.10, 0.15 | Business decision | — |
+| **Range coverage** | 90% | Documented assumption | — |
+| **Leftover data risk** $\sigma_D$ by PCS | 0.02 to 0.12 | Calibrate from the audit arm (below) | Audit arm + stored prefill and final MERCs |
+| **Chance the member is wrong** $q$ | 0.10 | Inspection findings on member-changed attributes (below) | Post-bind inspections |
+| **Credibility constant** $k$ | 25 | Bühlmann credibility, per H3 level | Book |
+| **Tier cutoffs** | 0.90, 0.70 | Shadow-mode tier mix plus correction rates ([section 9](#9-proving-it-works)) | Shadow-mode log |
+| **Guardrails** | 30 homes; $\lvert z \rvert$ > 3 | Review after shadow mode | Shadow-mode log |
+
+### Calibrating the leftover data risk by PCS
+
+The audit arm, a small random share of quotes where **every** material attribute is asked, makes this possible without any extra Verisk calls:
+
+- In the **audit arm**, the move from prefill to final MERC shows how wrong prefill MERCs are **in total**.
+- In the **normal flow**, the same move shows how much of that our **usual questions fix**.
+- The **difference** is what our usual questions leave behind, which is exactly $\sigma_D$.
+
+$$
+\sigma_D^2(\text{PCS}) \;\approx\; \operatorname{Var}_{\text{audit}}\!\big[\,s \mid \text{PCS}\,\big] \;-\; \operatorname{Var}_{\text{normal}}\!\big[\,s \mid \text{PCS}\,\big], \qquad s = \ln\frac{\text{final MERC}}{\text{prefill MERC}}
+$$
+
+↳ **In words:** the total error, minus the part our questions fix, leaves the part they don't.
+
+Practical details:
+
+- **Random assignment** to the audit arm is what makes the two groups comparable.
+- **Drop obvious data errors** (moves of 3× or more) before computing variances.
+- **Sample size:** the difference of two variances is noisy, so aim for a few thousand quotes per PCS level in each group, and pool adjacent levels where data is thin.
+- **Keep it monotonic:** a lower PCS should never get *less* leftover risk than a higher one.
+- **The approximation assumes** that errors our questions fix and errors they leave behind are independent. That's reasonable when they involve different attributes.
+
+### Calibrating the chance the member is wrong
+
+From post-bind inspections, among quotes where the member **changed** an attribute that drives MERC, measure how often the inspection found the member's value wrong. This uses attribute data only. Start with a single $q$; split it by attribute later if the data supports it.
+
+---
+
+## 9. Proving it works
+
+> **In one sentence:** run it silently first, then check that lower tiers really do have more problems, using attribute data.
+
+| Check | What to do | What good looks like |
+|---|---|---|
+| **Shadow mode** | Score every quote for 4–8 weeks without acting. Log $C$, the tier, the waterfall and the driver. | A stable tier mix |
+| **Tier mix** | Set cutoffs so Low is a share review or inspection can handle (for example, 2–4%) | A workable flag rate |
+| **Tier separation** | On the audit arm and post-bind inspections, compare attribute correction rates by tier | Correction rates rise clearly from High to Medium to Low |
+| **PCS sanity check** | Compare attribute correction rates by PCS level | Lower PCS, more corrections, which confirms the direction assumption |
+| **Review outcomes** | Track how often underwriters find a real problem on Low quotes | A meaningful share of Low quotes lead to a correction |
+| **Monitoring** | Review quarterly, and after every Verisk cost-data update | No drift |
+
+> ⚠️ **Why the audit arm matters:** in the normal flow we only see corrections on attributes we asked about. The audit arm is the only unbiased view, and it's also what calibrates $\sigma_D$.
+
+---
+
+## 10. Edge cases
+
+| Situation | What to do |
+|---|---|
+| **Member changed nothing** | Prefill and final are the same house. Set $q$ to 0; the score uses the final version only. |
+| **Member confirmed values without changing MERC** | Same as above. Confirmations don't create a "member was wrong" version. |
+| **Prefill MERC or range unavailable** | Skip the "member was wrong" version, and cap the tier at 🟡 Medium with the reason "no prefill MERC to compare." |
+| **PCS missing** | Use the PCS 1 value (the most cautious), and say so in the reason. |
+| **Final range missing** | Use the prefill range's spread, cap the tier at 🟡 Medium, and say so in the reason. If both ranges are missing, 🔴 Low with the reason "no Verisk range." |
+| **Square-footage change crosses a size band** | Each version uses the neighborhood reference for its own size band. |
+| **Range not centered on the MERC** | Only the range's *width* is used; the center is always the MERC itself. |
+
+---
+
+## 11. Contract checkpoints
+
+> **In one sentence:** everything here uses Verisk output from real quotes, as returned, with two aggregations that should be confirmed.
+
+| Use of Verisk output | Type | Status |
+|---|---|---|
+| Final MERC and range (quote-flow step 5) | Per quote, as returned | Already in use |
+| Prefill MERC and range (quote-flow step 2) | Per quote, on Verisk's own attributes for a real address | Confirm it's included in the prefill response. If it needs its own call, that call prices a real house as Verisk describes it, not a hypothetical one. |
+| Property Confidence Score | Per quote, as returned | Already in use in the attribute model |
+| Neighborhood \$/sqft reference | Stored MERCs aggregated across the book | Confirmed acceptable by the team |
+| Calibration of $\sigma_D$ by PCS | Stored prefill and final MERCs aggregated across the book | **Confirm it's in the same category as the neighborhood reference.** If not, keep the judgment starting values and validate with attribute data only. |
+
+> ⚖️ **Design principle:** no what-if calls, no designed studies, and no model with MERC as the outcome. MERC is only ever *looked up* or *compared*.
+
+---
+
+## 12. Rollout plan
+
+| Phase | What happens | Duration |
+|---|---|---|
+| **1 · Build** | Neighborhood reference from the book; scoring code in the quote flow; starting parameter values; audit arm switched on | — |
+| **2 · Shadow mode** | Score and log every quote without acting | 4–8 weeks |
+| **3 · Calibrate** | Set tier cutoffs from the tier mix; calibrate $\sigma_D$ and $q$ as data allows; check tier separation | After shadow mode |
+| **4 · Act** | Route 🔴 Low to review or inspection; show reason codes to underwriting | Ongoing |
+| **5 · Monitor** | Quarterly review, plus a check after every Verisk cost-data update | Ongoing |
+
+---
+
+## 13. Known limitations
+
+- **Blind to square-footage errors** that nobody corrected. The neighborhood estimate scales with square footage, so the error cancels. The PCS partly covers this, and the attribute model's neighborhood plausibility check on square footage remains the main guard.
+- **The leftover data risk is the same for every quote at a given PCS,** however many attributes the member confirmed. A natural refinement is to shrink $\sigma_D$ as more MERC-driving attributes are confirmed.
+- **"Member was wrong" assumes the prefill was right.** In reality both could be wrong, or only some of the member's changes could be wrong. The two-version average is a deliberate simplification.
+- **Neighbors are priced by the same engine.** An area-wide Verisk bias is invisible to the neighborhood signal, which is why agreement never narrows the spread.
+- **Range meaning and PCS direction are assumptions.** Both are documented in section 4, along with which way the score errs if they're wrong.
+- **It works at the whole-house level.** It can't say *which* attribute is wrong. The full attribute-level method, pending contract review, can.
+
+---
+
+## Appendix A: Notation cheat sheet
+
+| Symbol | Plain English | Comes from |
+|:-:|---|---|
+| $s$ | Log change from prefill MERC to final MERC | Signals 1 and 2 |
+| $\sigma_V$ | Verisk's precision: the range as a log-scale spread | Signal 2 (or 1, for the "member was wrong" version) |
+| $\sigma_D$ | Leftover data risk | Signal 3, via the PCS table |
+| $\sigma$ | Total uncertainty of one version: $\sqrt{\sigma_V^2 + \sigma_D^2}$ | Signals 1–3 |
+| $N$ | Neighborhood estimate: typical \$/sqft nearby × square footage | Signal 4 |
+| $\sigma_N$ | Neighborhood spread | Signal 4 |
+| $w$ | Neighborhood pull: $\sigma^2 / (\sigma^2 + \sigma_N^2)$ | Signals 2–4 |
+| $\delta$ | Center of the true cost, as a log offset from the quote | Signals 1–4 |
+| $q$ | Chance the member's changes are wrong | Inspections |
+| $c$ | Chance of landing in tolerance for one version | Section 5, step 3 |
+| $C$ | MERC confidence: the weighted average of the two versions | Section 5, step 4 |
+| $\tau_{\text{under}}, \tau_{\text{over}}$ | How far too low or too high the MERC may be | Business decision |
+| $z$ | How many neighborhood spreads the home's \$/sqft sits from typical | Signal 4 (guardrail) |
+
+---
+
+## Appendix B: Reference code
+
+A minimal implementation of everything in this document. The last block reproduces Home 1. For building the neighborhood reference from the book (`prepare_book` and `cell_stats`), reuse the code from the interim method's appendix.
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+# ---- Parameters: illustrative starting values (section 8) ---------------------
+TOL_UNDER, TOL_OVER = 0.10, 0.15      # MERC may be ~10% too low or ~15% too high
+RANGE_Z = 1.645                       # Verisk ranges assumed to be 90% ranges
+SIGMA_PCS = {5: 0.02, 4: 0.035, 3: 0.05, 2: 0.08, 1: 0.12}   # leftover data risk by PCS
+P_MEMBER_WRONG = 0.10                 # chance the member's changes are wrong
+HIGH_CUT, LOW_CUT = 0.90, 0.70        # tier cutoffs on confidence
+MIN_NEARBY, EXTREME_Z = 30, 3.0       # guardrails
+MAD_FLOOR = 0.02
+
+
+# ---- Signal 4: H3 neighborhood reference (built from the book) ----------------
+def blend_neighborhood(cells, k=25):
+    """Credibility-blend median and MAD of log $/sqft from the state down to r7."""
+    center, log_mad = cells[0]["median"], np.log(max(cells[0]["mad"], MAD_FLOOR))
+    for c in cells[1:]:
+        w = c["n"] / (c["n"] + k)
+        w_spread = w if c["n"] >= 3 else 0.0
+        center = w * c["median"] + (1 - w) * center
+        log_mad = w_spread * np.log(max(c["mad"], MAD_FLOOR)) + (1 - w_spread) * log_mad
+    n_r5 = next((c["n"] for c in cells if c["level"] == "h3_r5"), 0)
+    return {"center": center, "spread": 1.4826 * np.exp(log_mad), "n_r5": n_r5}
+
+
+# ---- Signals 1-3 plus the neighborhood, for one version of the house ----------
+def spread_from_range(low, high):
+    """A Verisk range as a log-scale standard deviation."""
+    return np.log(high / low) / (2 * RANGE_Z)
+
+
+def chance_in_tolerance(offset, sd):
+    """Chance the quote is within tolerance when the truth is centered `offset` (log) away."""
+    return norm.cdf((TOL_UNDER - offset) / sd) - norm.cdf((-TOL_OVER - offset) / sd)
+
+
+def one_version(est, quote_merc, pcs, nbhd, use_pcs=True, use_nbhd=True):
+    s_engine = spread_from_range(est["low"], est["high"])             # signal 1 or 2
+    s_data = SIGMA_PCS[pcs] if use_pcs else 0.0                       # signal 3
+    s_total = np.hypot(s_engine, s_data)
+    n_est = np.exp(nbhd["center"]) * est["sqft"]                      # signal 4
+    pull = s_total**2 / (s_total**2 + nbhd["spread"]**2) if use_nbhd else 0.0
+    offset = np.log(est["merc"] / quote_merc) + pull * np.log(n_est / est["merc"])
+    return {"s_engine": s_engine, "s_data": s_data, "s_total": s_total, "n_est": n_est,
+            "pull": pull, "offset": offset, "c": chance_in_tolerance(offset, s_total)}
+
+
+def merc_confidence(prefill, final, pcs, nbhd, nbhd_prefill=None,
+                    use_pcs=True, use_nbhd=True, use_prefill=True):
+    """Weighted average of 'member was right' and 'member was wrong'."""
+    changed = not np.isclose(prefill["merc"], final["merc"])
+    q = P_MEMBER_WRONG if (changed and use_prefill) else 0.0
+    right = one_version(final, final["merc"], pcs, nbhd, use_pcs, use_nbhd)
+    wrong = one_version(prefill, final["merc"], pcs, nbhd_prefill or nbhd, use_pcs, use_nbhd)
+    return (1 - q) * right["c"] + q * wrong["c"], right, wrong
+
+
+# ---- Tier, guardrails and main driver -----------------------------------------
+STEPS = [
+    ("Final MERC range", dict(use_pcs=False, use_nbhd=False, use_prefill=False)),
+    ("Property Confidence Score", dict(use_nbhd=False, use_prefill=False)),
+    ("Neighborhood estimate", dict(use_prefill=False)),
+    ("Prefill vs. final", dict()),
+]
+
+
+def score_quote(prefill, final, pcs, nbhd, nbhd_prefill=None):
+    waterfall = [(label, merc_confidence(prefill, final, pcs, nbhd, nbhd_prefill, **kw)[0])
+                 for label, kw in STEPS]
+    c = waterfall[-1][1]
+    t = "High" if c >= HIGH_CUT else "Medium" if c >= LOW_CUT else "Low"
+    z = (np.log(final["merc"] / final["sqft"]) - nbhd["center"]) / nbhd["spread"]
+    flags = []
+    if nbhd["n_r5"] < MIN_NEARBY:
+        flags.append("few comparable homes nearby")
+    if abs(z) > EXTREME_Z:
+        flags.append("far outside the neighborhood's $/sqft")
+    if flags and t == "High":
+        t = "Medium"
+    before = [1.0] + [v for _, v in waterfall[:-1]]
+    drops = {label: b - v for (label, v), b in zip(waterfall, before)}
+    return {"confidence": c, "tier": t, "z": z, "flags": flags,
+            "main_driver": max(drops, key=drops.get), "waterfall": waterfall}
+
+
+# ---- Calibration: leftover data risk by PCS (section 8) -----------------------
+def calibrate_sigma_pcs(quotes):
+    """quotes: prefill_merc, final_merc, pcs, audit (True = every attribute asked)."""
+    q = quotes.assign(shift=np.log(quotes["final_merc"] / quotes["prefill_merc"]))
+    q = q[q["shift"].abs() < np.log(3)]                       # drop data errors (3x moves)
+    var = q.groupby(["pcs", "audit"])["shift"].var().unstack()
+    sigma = np.sqrt((var[True] - var[False]).clip(lower=0))
+    return sigma.sort_index(ascending=False).cummax()         # lower PCS never gets less risk
+
+
+# ---- Worked example -----------------------------------------------------------
+nbhd = blend_neighborhood([  # size band 2 (1,800-2,500 sq ft)
+    {"level": "state", "n": 48_000, "median": np.log(168), "mad": 0.110},
+    {"level": "h3_r4", "n": 2_400,  "median": np.log(176), "mad": 0.090},
+    {"level": "h3_r5", "n": 310,    "median": np.log(179), "mad": 0.080},
+    {"level": "h3_r6", "n": 42,     "median": np.log(184), "mad": 0.070},
+    {"level": "h3_r7", "n": 9,      "median": np.log(190), "mad": 0.050},
+])
+prefill = {"merc": 335_000, "low": 306_000, "high": 367_000, "sqft": 1_950}
+final = {"merc": 372_000, "low": 341_000, "high": 405_000, "sqft": 2_150}
+result = score_quote(prefill, final, pcs=3, nbhd=nbhd)
+print(f"{result['tier']} ({result['confidence']:.3f}), main driver: {result['main_driver']}")
+# Medium (0.848), main driver: Property Confidence Score
+```
