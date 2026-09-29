@@ -25,7 +25,7 @@ Ingredients 1 and 2 combine into a probability that sets the tier. Ingredient 3 
 There are two ways to measure how much each attribute moves MERC:
 
 - **Option A: No extra calls.** A lookup table built once from a designed study of Verisk calls.
-- **Option B: A few extra calls.** For the one to three attributes that matter most on a quote, ask Verisk directly.
+- **Option B: A few extra calls.** For the one to three attributes that matter most on a quote, ask Verisk what the MERC would be if that attribute were different.
 
 > **Nothing upstream changes.** The attribute confidence model and the question logic stay exactly as they are. The score is a new step at the end.
 
@@ -68,6 +68,8 @@ Two constraints shape the answer.
 ## 2. Where this fits in the quote flow
 
 > **In one sentence:** steps 1–5 are unchanged; the MERC confidence score is a new step 6.
+
+Wherever this document says **"quote-flow step N,"** it means a step in this table. Other step lists are labeled differently (A1–A4 and B1–B3 in [section 6](#6-measuring-merc-impact-option-a-or-option-b), Parts 1–5 in [section 10](#10-worked-example)).
 
 ```mermaid
 flowchart LR
@@ -165,6 +167,7 @@ flowchart LR
     classDef result fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#0F172A
     class Q1,Q2,Q3,SIM,ENG,NBR ingredient
     class CONF,BASE,FINAL result
+    style ING1 fill:#F8FAFC,stroke:#94A3B8,stroke-dasharray:5 4,color:#334155
 ```
 
 1. **List the attributes we didn't ask about.** Member-confirmed attributes count as known.
@@ -180,7 +183,7 @@ flowchart LR
 
 > **In one sentence:** for each attribute we didn't ask about, weigh how likely it is to be wrong against how much MERC would move if it were, then add up the possibilities.
 
-After step 4, every attribute is in one of two states:
+After the member finishes answering (quote-flow step 4), every attribute is in one of two states:
 
 | State | Example | How we treat it |
 |---|---|---|
@@ -220,7 +223,13 @@ Our book records every time a member or an inspection corrected a prefilled attr
 
 ### 5.3 How much would MERC move?
 
-This is the **MERC impact** $\Delta_k$: the change in log-MERC if attribute $k$ took its corrected value while everything else stayed the same.
+This is the **MERC impact** $\Delta_k$: the change in log-MERC if attribute $k$ took its corrected value while everything else stayed the same. However it's measured, it comes from comparing two Verisk MERCs:
+
+$$
+\Delta_k \;=\; \ln\!\left(\frac{\text{MERC with only attribute } k \text{ changed}}{\text{MERC before the change}}\right)
+$$
+
+↳ **In words:** if changing square footage alone takes the MERC from \$372,000 to \$423,500, the impact is ln(1.138) = +0.130, or about +13.8%.
 
 A useful property of rebuild-cost engines makes this manageable. MERC is mostly *area × cost per unit × adjustment factors*, and on the log scale those effects add. So we can measure each attribute's impact **one at a time** and sum them, rather than testing every combination.
 
@@ -251,7 +260,9 @@ We don't solve this on paper. We **simulate** it:
 3. If it's wrong, pick a corrected value from its correction profile and look up the MERC impact.
 4. Add up the impacts. The total is one possible leftover error.
 
-The 100,000 totals form the distribution of $D$. This takes milliseconds and needs no Verisk calls.
+The 100,000 totals form the distribution of $D$. The simulation itself takes milliseconds and needs no Verisk calls.
+
+Think of each draw as one possible true house. [The Option B version](#the-option-b-version) in the worked example walks through this by hand for one attribute.
 
 > 💡 **Why simulate instead of using a formula?** In most draws nothing is wrong, so the distribution is a tall spike at zero plus a scattered tail. A mean-and-variance summary smooths that shape away and gets the tails wrong, and the tails are exactly what the score is about.
 
@@ -261,6 +272,11 @@ The 100,000 totals form the distribution of $D$. This takes milliseconds and nee
 
 > **In one sentence:** get MERC impacts either from a one-time designed study, with no extra calls per quote, or by asking Verisk directly for the few attributes that matter on each quote.
 
+Both options measure impacts the same way, with **what-if calls**. A what-if call sends Verisk a set of attributes with exactly one value changed, and the impact is how far its MERC moves from the MERC before the change ([section 5.3](#53-how-much-would-merc-move)). The options differ in where and when those calls happen:
+
+- **Option A** makes them once, ahead of time, on a sample of homes, and stores the results in a lookup table.
+- **Option B** makes them live, on the home being quoted.
+
 | | **Option A: No extra calls** | **Option B: A few extra calls** |
 |---|---|---|
 | **Extra Verisk calls per quote** | 0 | 0–3, usually 0–1 |
@@ -268,7 +284,7 @@ The 100,000 totals form the distribution of $D$. This takes milliseconds and nee
 | **Precision** | Typical impact for similar homes | Exact for this home |
 | **Upfront work** | Design and run the study | Build a screening rule |
 | **Upkeep** | Refresh the table about once a year | None |
-| **Added latency** | None | None, since the calls run alongside step 5 |
+| **Added wait for the member** | None | Little or none, since the calls go out with the final MERC call (quote-flow step 5) |
 | **Contract questions** | Storing effects derived from Verisk output | "What-if" calls and per-call cost |
 
 ### Option A: No extra calls
@@ -279,10 +295,10 @@ The 100,000 totals form the distribution of $D$. This takes milliseconds and nee
 
 | Step | What to do | Why |
 |---|---|---|
-| **1 · Choose base homes** | A stratified sample of 1,000–2,000 homes from the book, by region (state or H3 r4) × size band × stories × construction | Covers the homes we actually quote. Aim for at least 20–30 homes per stratum. |
-| **2 · Change one thing at a time** | For each base home, call once as is, then once per single change: square footage ±10% and ±20%, year built ±10 years, and each plausible alternative for stories, construction, roof, foundation, garage and quality | Isolates each attribute's own effect. About 15 calls per home. |
-| **3 · Test interactions** | On about 200 base homes, change square footage, stories and construction together, at two levels each, in all 8 combinations | Checks that effects really add up, and flags pairs that don't |
-| **4 · Summarize** | For each stratum and change, record the median log-impact and its spread | This is the lookup table |
+| **A1 · Choose base homes** | A stratified sample of 1,000–2,000 homes from the book, by region (state or H3 r4) × size band × stories × construction | Covers the homes we actually quote. Aim for at least 20–30 homes per stratum. |
+| **A2 · Change one thing at a time** | For each base home, call once as is, then once per single change: square footage ±10% and ±20%, year built ±10 years, and each plausible alternative for stories, construction, roof, foundation, garage and quality | Isolates each attribute's own effect. About 15 calls per home. |
+| **A3 · Test interactions** | On about 200 base homes, change square footage, stories and construction together, at two levels each, in all 8 combinations | Checks that effects really add up, and flags pairs that don't |
+| **A4 · Summarize** | Compute each impact as ln(what-if MERC ÷ base MERC). For each stratum and change, record the median impact and its spread. | This is the lookup table |
 
 #### What the table looks like (illustrative)
 
@@ -310,7 +326,7 @@ The 100,000 totals form the distribution of $D$. This takes milliseconds and nee
 
 **The idea:** for the one to three not-asked attributes that matter most on *this* quote, ask Verisk directly what MERC would be if that attribute took its most likely alternative value.
 
-**Step 1 · Screen.** Score each not-asked attribute's **materiality**:
+**B1 · Screen.** Score each not-asked attribute's **materiality**:
 
 $$
 m_k \;=\; (1 - p_k) \times \text{typical } \lvert \Delta_k \rvert
@@ -320,14 +336,67 @@ $$
 
 Only attributes above a threshold get a call, capped at two or three per quote. Most quotes need none.
 
-**Step 2 · Call.** For each selected attribute, call Verisk with the final attributes, changing only that one:
+**B2 · Call.** For each selected attribute, make a what-if call: the final attributes, with only that attribute changed.
 
 - **Continuous:** one call at a typical "if wrong" value, such as the median correction. Use two calls, one per direction, when corrections go both ways.
 - **Categorical:** one call per likely alternative, usually just one.
 
-**Step 3 · Use.** Plug the exact impacts into the simulation. Every other attribute still uses the table or priors.
+**B3 · Use.** Turn each what-if MERC into an impact by comparing it with the final MERC:
 
-> 📌 **In practice:** these calls need only the final attributes, so they can fire **in parallel with the step 5 call** and add no latency. Each one also returns a range, which shows whether Verisk's engine spread shifts across scenarios.
+$$
+\Delta \;=\; \ln\!\left(\frac{\text{what-if MERC}}{\text{final MERC}}\right)
+$$
+
+↳ **In words:** the impact is how far the what-if MERC sits from the MERC we're quoting.
+
+Each impact then replaces the table value in the simulation:
+
+- **Categorical attribute:** use the impact as is. Whenever a draw says the attribute is wrong and picks that alternative, add the impact to that draw's total.
+- **Continuous attribute with a few distinct scenarios** (for example, basement included or not): the same, with one call per scenario.
+- **Continuous attribute with spread-out corrections:** turn the call into an elasticity, $e = \Delta \,/\, \ln(\text{tested value} \,/\, \text{final value})$, and apply it to every corrected value the simulation draws, as in [section 5.3](#53-how-much-would-merc-move). Use the upward call's elasticity for larger values and the downward call's for smaller ones.
+- **Attributes that didn't get a call** keep their table or prior impacts.
+
+[The Option B version](#the-option-b-version) of the worked example follows one quote from the calls to the final confidence.
+
+#### What about the ranges from the what-if calls?
+
+Each what-if call also returns a range, but the score doesn't need it: the engine spread comes from the final call's range ([section 7](#7-ingredient-2-engine-uncertainty)). Log it anyway, because it answers a useful question: is Verisk about as precise for the what-if house as for the quoted one?
+
+| What the logged ranges show | What to do |
+|---|---|
+| About the same width, in percent, as the final call's range | Nothing. The final call's range is accurate everywhere. |
+| Noticeably wider or narrower | In draws where the true house is that what-if house, use its range for the engine spread |
+
+#### When to send the calls
+
+Screening needs only the attribute confidences and the final attributes, and both are known as soon as the member finishes answering. So the what-if calls don't wait for anything. They go out **at the same moment as the final MERC call** (quote-flow step 5), and the member waits about as long as they do today.
+
+```mermaid
+flowchart LR
+    S4["Member finishes answering<br/>quote-flow step 4"]
+    B1["B1 · Screen<br/>instant, no calls"]
+    subgraph SAME["Sent at the same time"]
+        S5["Final MERC call<br/>quote-flow step 5"]
+        B2["B2 · What-if calls<br/>one change each"]
+    end
+    B3["B3 · Impacts<br/>what-if vs. final"]
+    S6["MERC confidence<br/>quote-flow step 6"]
+
+    S4 --> B1
+    B1 --> S5
+    B1 --> B2
+    S5 --> B3
+    B2 --> B3
+    B3 --> S6
+
+    classDef existing fill:#F1F5F9,stroke:#94A3B8,color:#0F172A
+    classDef new fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#0F172A
+    class S4,S5 existing
+    class B1,B2,B3,S6 new
+    style SAME fill:#F8FAFC,stroke:#94A3B8,stroke-dasharray:5 4,color:#334155
+```
+
+If the score is only used after the quote is shown, for inspection routing or underwriting review, the calls can even run afterwards.
 
 ### Which option should we use?
 
@@ -353,7 +422,7 @@ The range might reflect cost uncertainty only (labor, materials, finish), or it 
 | What happens to the range | What it means | What to do |
 |---|---|---|
 | It **stays the same** | It reflects cost uncertainty only | Use it as is |
-| It **narrows** when attributes are passed | It includes attribute uncertainty | In step 5, always pass every final attribute explicitly, and use that range |
+| It **narrows** when attributes are passed | It includes attribute uncertainty | In the final MERC call (quote-flow step 5), always pass every final attribute explicitly, and use that range |
 
 While you're at it, ask Verisk what coverage the range is meant to have, such as 90%.
 
@@ -365,6 +434,8 @@ $$
 
 ↳ **In words:** the width of the range on the log scale, divided by the width of a 90% Normal interval. $U$ and $L$ are the top and bottom of the range. Use 1.645 for a 90% range and 1.96 for a 95% range. If Verisk can't state the coverage, start at 90% and revisit.
 
+> 📌 **Which range?** Always the range from the final MERC call (quote-flow step 5). Option B's what-if calls return ranges too; [section 6](#what-about-the-ranges-from-the-what-if-calls) explains when to use them.
+
 ### 7.3 Combine with leftover attribute risk
 
 For each simulated draw $D_i$, the chance that Verisk's own noise still leaves the MERC in tolerance has a closed form. Averaging across the draws gives the confidence:
@@ -374,6 +445,18 @@ C \;=\; \frac{1}{N}\sum_{i=1}^{N}\left[\,\Phi\!\left(\frac{\tau_{\text{under}} -
 $$
 
 ↳ **In words:** for each possible true house, take the chance that engine noise keeps the MERC in tolerance, then average over all the possible houses. $\Phi$ is the standard Normal CDF and $N$ is the number of draws.
+
+**What a draw is.** Each draw $D_i$ is one row from the simulation in [section 5.4](#54-putting-it-together-simulate): one made-up version of the house, built by flipping a weighted coin for every not-asked attribute. Here are five draws for the worked example (tolerance: 10% too low, 15% too high; engine spread 0.052):
+
+| Draw | What the coin flips said | $D_i$ (true house's MERC vs. the quote) | Chance the quote is within tolerance |
+|:-:|---|:-:|:-:|
+| 1 | Everything right | 0 | 97.0% |
+| 2 | Square footage really 18% larger | +15.1% | 21.8% |
+| 3 | Construction really masonry veneer | +5.1% | 83.1% |
+| 4 | Square footage 12% smaller *and* really 2 stories | −15.5% | 36.1% |
+| 5 | Everything right | 0 | 97.0% |
+
+Across 100,000 draws, most look like rows 1 and 5 (about 69% in the example), a few look like the others, and $C$ is the average of the last column.
 
 > 📌 **In practice:** also keep the **attribute-only** version: the share of draws where $D$ alone is within tolerance. It's the part we can validate directly ([section 11](#11-proving-it-works)).
 
@@ -441,7 +524,7 @@ An outlier explained by attributes the member just confirmed, such as "custom qu
 
 > **In one sentence:** $C$ sets the base tier, and the neighborhood score can only lower it.
 
-**Step 1 · Base tier from $C$**
+**First · Base tier from $C$**
 
 | Confidence $C$ | Base tier |
 |:-:|:-:|
@@ -449,7 +532,7 @@ An outlier explained by attributes the member just confirmed, such as "custom qu
 | 0.70 up to 0.90 | 🟡 Medium |
 | Below 0.70 | 🔴 Low |
 
-**Step 2 · Neighborhood override**
+**Then · Neighborhood override**
 
 | Neighborhood score | What happens |
 |:-:|---|
@@ -490,7 +573,7 @@ All numbers are illustrative. Every figure below was computed with the code in [
 | **Not asked** | Square footage, stories, construction, roof, year built |
 | **Tolerance** | MERC no more than 10% too low, and no more than 15% too high |
 
-### Step 1 · Leftover attribute risk
+### Part 1 · Leftover attribute risk
 
 | Not-asked attribute | $p_k$ | If wrong, it's usually… | MERC impact if wrong | Materiality $m_k$ |
 |---|:-:|---|:-:|:-:|
@@ -509,7 +592,7 @@ The square-footage impacts use an elasticity of 0.85 from the sensitivity table.
 - In **0.4%** of draws, the MERC is more than 15% too high.
 - Attribute-only confidence: **0.92**.
 
-### Step 2 · Engine uncertainty
+### Part 2 · Engine uncertainty
 
 $$
 \sigma_V \;=\; \frac{\ln 405{,}000 - \ln 341{,}000}{2 \times 1.645} \;=\; 0.052
@@ -517,11 +600,11 @@ $$
 
 That's about ±5% at one standard deviation. Even if every attribute were certain, this home's confidence would top out at **0.97**.
 
-### Step 3 · Confidence and base tier
+### Part 3 · Confidence and base tier
 
 Combining the two gives **$C$ = 0.893 → 🟡 Medium**, just short of the 0.90 needed for High.
 
-### Step 4 · Neighborhood check
+### Part 4 · Neighborhood check
 
 | H3 level | Homes in cell | Cell median \$/sqft | Weight $w$ | Blended center |
 |:-:|--:|--:|:-:|--:|
@@ -539,7 +622,7 @@ $$
 
 That's well within ±2, so the tier stays 🟡 **Medium**.
 
-### Step 5 · Main driver
+### Part 5 · Main driver
 
 | If we had also confirmed… | New $C$ | Lift |
 |---|:-:|:-:|
@@ -547,7 +630,7 @@ That's well within ±2, so the tier stays 🟡 **Medium**.
 | Construction | 0.899 | +0.006 |
 | Roof, year built or stories | 0.893 to 0.894 | under 0.002 |
 
-> 💡 **The takeaway:** square footage cleared the attribute threshold at 86%, but it's also the attribute MERC is most sensitive to. Surfacing that combination is exactly what this score is for. Over time, reason codes like this one show which attributes most often hold MERC confidence back. That's useful evidence if the step 4 thresholds are ever revisited.
+> 💡 **The takeaway:** square footage cleared the attribute threshold at 86%, but it's also the attribute MERC is most sensitive to. Surfacing that combination is exactly what this score is for. Over time, reason codes like this one show which attributes most often hold MERC confidence back. That's useful evidence if the question thresholds in quote-flow step 4 are ever revisited.
 
 ### What the output looks like
 
@@ -560,7 +643,34 @@ That's well within ±2, so the tier stays 🟡 **Medium**.
 
 ### The Option B version
 
-Only square footage clears a materiality threshold of, say, 0.005, so Option B spends **two calls**: one at 2,537 sq ft (18% larger) and one at 1,892 sq ft (12% smaller). Suppose Verisk returns \$423,500 and \$332,000:
+Only square footage clears a materiality threshold of, say, 0.005, so Option B makes **two what-if calls**, sent at the same time as the final MERC call. Suppose Verisk returns:
+
+| Call | Square footage | Verisk MERC | Verisk range |
+|---|--:|--:|--:|
+| Final (quote-flow step 5) | 2,150 | \$372,000 | \$341,000 to \$405,000 |
+| What-if: 18% larger | 2,537 | \$423,500 | \$388,000 to \$461,000 |
+| What-if: 12% smaller | 1,892 | \$332,000 | \$304,000 to \$361,000 |
+
+**From calls to impacts.** Compare each what-if MERC with the final MERC:
+
+- **18% larger:** ln(423,500 ÷ 372,000) = +0.130, or +13.8%
+- **12% smaller:** ln(332,000 ÷ 372,000) = −0.114, or −10.8%
+
+**From impacts to confidence.** Take square footage on its own for a moment. Each call describes one possible true house, and the score is a weighted average over them:
+
+| Possible true house | Chance | Its MERC vs. the quote | Chance the quote is within tolerance |
+|---|:-:|:-:|:-:|
+| As quoted: 2,150 sq ft | 86.0% | 0 | 97.0% |
+| 18% larger: 2,537 sq ft | 7.7% | +13.8% | 28.5% |
+| 12% smaller: 1,892 sq ft | 6.3% | −10.8% | 75.6% |
+| **Weighted average** | | | **90.4%** |
+
+- **Chance** comes from the attribute model (86% confident) and the correction profile (when wrong, 55% larger and 45% smaller).
+- **Chance the quote is within tolerance** applies the tolerance and the engine spread. The larger house's MERC is 13.8% above the quote, past the 10% limit, so the quote usually misses for that house.
+- **Without the engine spread**, the last column would read 100%, 0% and 100%, giving 92.3%. That's the attribute-only view from Part 1.
+- **The what-if ranges** are the same width in percent as the final call's range (a spread of 0.052 in all three), so they change nothing here.
+
+The simulation does the same thing for all five not-asked attributes at once, including draws where two are wrong together. That brings the confidence to **0.896**, still 🟡 Medium.
 
 | | Option A (table) | Option B (calls) |
 |---|:-:|:-:|
@@ -667,9 +777,9 @@ Review the tier mix, audit results and override rate every quarter, and again af
 
 | Symbol | Plain English | Comes from |
 |:-:|---|---|
-| $p_k$ | Confidence that attribute $k$'s prefill value is correct | Attribute model (step 3) |
+| $p_k$ | Confidence that attribute $k$'s prefill value is correct | Attribute model (quote-flow step 3) |
 | $W_k$ | 1 if attribute $k$ is actually wrong, 0 if not | Simulated: 1 with probability $1 - p_k$ |
-| $\Delta_k$ | Change in log-MERC if attribute $k$ took its corrected value | Option A table or Option B call |
+| $\Delta_k$ | Change in log-MERC if attribute $k$ took its corrected value | Option A table, or an Option B what-if call: ln(what-if MERC ÷ final MERC) |
 | $e_k$ | Elasticity: % change in MERC per % change in a continuous attribute | Option A table or Option B call |
 | $D$ | Leftover attribute error | Simulation |
 | $\varepsilon_V$ | Engine error | Verisk |
@@ -715,7 +825,7 @@ def merc_confidence(not_asked, sigma_v, tol_under=0.10, tol_over=0.15,
     Chance that the final MERC is within tolerance of the true rebuild cost.
 
     not_asked: one dict per attribute the member was NOT asked about
-        p_correct : confidence from the attribute model (step 3)
+        p_correct : confidence from the attribute model (quote-flow step 3)
         impacts   : change in log-MERC for each 'if wrong' value
         weights   : how often each 'if wrong' value occurs (sums to 1)
     sigma_v: engine spread from engine_spread()
@@ -728,6 +838,16 @@ def merc_confidence(not_asked, sigma_v, tol_under=0.10, tol_over=0.15,
         D += wrong * np.asarray(a["impacts"])[pick]         # add the impact if wrong
     in_tol = norm.cdf((tol_under - D) / sigma_v) - norm.cdf((-tol_over - D) / sigma_v)
     return in_tol.mean()
+
+
+def impact(whatif_merc, final_merc):
+    """Option B: the change in log-MERC shown by one what-if call."""
+    return np.log(whatif_merc / final_merc)
+
+
+def elasticity(whatif_merc, final_merc, whatif_value, final_value):
+    """Option B, continuous attribute: % change in MERC per % change in the attribute."""
+    return impact(whatif_merc, final_merc) / np.log(whatif_value / final_value)
 
 
 def main_driver(not_asked, sigma_v, **kw):
@@ -789,4 +909,16 @@ z = (np.log(372_000 / 2_150) - mu) / sd
 driver, lifts = main_driver(not_asked, sigma_v)
 print(f"C = {C:.3f}   z = {z:.2f}   tier = {tier(C, z)}   main driver = {driver}")
 # C = 0.893   z = -0.63   tier = Medium   main driver = square footage
+
+# ---- Option B: two what-if calls replace the table's square-footage impacts ----
+sqft_b = dict(not_asked[0], impacts=[impact(423_500, 372_000),   # 2,537 sq ft
+                                     impact(332_000, 372_000)])  # 1,892 sq ft
+C_b = merc_confidence([sqft_b] + not_asked[1:], sigma_v)
+print(f"Option B: C = {C_b:.3f}   tier = {tier(C_b, z)}")
+# Option B: C = 0.896   tier = Medium
+
+# For spread-out corrections, turn each call into an elasticity instead, and apply
+# it to every corrected value in the profile.
+e_up = elasticity(423_500, 372_000, 2_537, 2_150)      # 0.78, for larger values
+e_down = elasticity(332_000, 372_000, 1_892, 2_150)    # 0.89, for smaller values
 ```
