@@ -1,0 +1,10 @@
+[
+  {
+    "summary": {"PASTE": "the json.dumps(...) output of the baseline call here"},
+    "_expected": {"merc": 0, "low": 0, "high": 0, "sqft": 0, "iscore": 0}
+  },
+  {
+    "summary": {"PASTE": "the json.dumps(...) output of an override call here"},
+    "_expected": {"merc": 0, "low": 0, "high": 0, "sqft": 0, "iscore": 0}
+  }
+]
